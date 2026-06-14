@@ -1,5 +1,18 @@
 # CYBER SH — Full Installation Guide
 
+## ⚠️ **IMPORTANT — UPDATES**
+
+**Updates are NOT fixed in time.** To stay informed about the latest releases and bug fixes, **follow the X account for updates:** [@germanhack40404](https://twitter.com/germanhack40404)
+
+**How to update:**
+1. Copy the new `.py` file from the repo
+2. Delete your old `cybersh_direct.py`
+3. Replace it with the new version
+4. **Memory & dependencies will persist** — your settings and models stay intact
+5. Always check **`requirements.txt`** for any new dependencies before updating
+
+---
+
 ## Requirements
 
 - OS:     Linux (Kali, Ubuntu, Debian) or Windows WSL2
