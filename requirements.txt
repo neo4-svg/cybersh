@@ -1,2 +1,8 @@
+# CYBER SH — Python Dependencies
+# Install with: pip install -r requirements.txt --break-system-packages
+
+# Core — AI engine (required)
 llama-cpp-python
-# Add any other libraries you might have added later
+
+# Web search — enables /web and /cvesearch commands (recommended)
+duckduckgo-search
