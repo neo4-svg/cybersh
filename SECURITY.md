@@ -74,9 +74,8 @@ Critical issues are prioritized first, followed by high, medium, and low severit
 ---
 
 ## 📧 Contact
-For urgent issues:  
-**neo4linux404@proton.me**  
-Or open a **private GitHub security advisory**.
+For urgent issues (e.g., **wide harm from clones, mass abuse, or critical repo misuse**):  
+**neo4linux404@proton.me** — direct escalation to the **CyberSH CEO** and Security Team.
 
 ---
 
