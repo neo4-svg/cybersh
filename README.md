@@ -12,7 +12,7 @@
 **CYBER SH — Your Personal Offline AI Assistant**  
 Runs entirely on your own computer. No cloud. No subscriptions. No one watching.
 
-![Version](https://img.shields.io/badge/version-1.2-brightgreen)
+![Version](https://img.shields.io/badge/version-1.3-brightgreen)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-orange)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows%20WSL-lightgrey)
@@ -28,16 +28,19 @@ Runs entirely on your own computer. No cloud. No subscriptions. No one watching.
 | Feature | Needs Internet? |
 |---------|----------------|
 | AI chat, all modes | ❌ No |
-| Memory, personas, goals | ❌ No |
+| Memory, personas, goals, sessions | ❌ No |
 | Code help, file analysis | ❌ No |
-| Security tools, payloads | ❌ No |
+| Security tools (hash, headers needs internet, payloads offline) | Mixed — see below |
 | `/web` — web search | ✅ Yes |
 | `/weather` — weather | ✅ Yes |
 | `/summarize` — read a URL | ✅ Yes |
 | `/cvesearch` — CVE lookup | ✅ Yes |
+| `/headers` — check a site's security headers | ✅ Yes |
+| `/ipinfo` `/gist` `/gitlog <url>` | ✅ Yes |
+| `/speedtest` | ✅ Yes |
 | Auto-update on startup | ✅ Yes (skipped automatically if offline) |
 
-> **Privacy note:** When you use `/web` or any internet feature, your search goes directly from **your computer** to the search service. It never passes through any third-party server or CYBER SH infrastructure. Your queries are yours alone.
+> **Privacy note:** When you use any internet feature, the request goes directly from **your computer** to the relevant service (DuckDuckGo, GitHub, wttr.in, etc.). It never passes through any third-party server or CYBER SH infrastructure. Your queries are yours alone.
 
 ---
 
@@ -50,7 +53,7 @@ CYBER SH **updates itself automatically every time you run it.**
 - If you are offline, it simply skips the check and continues normally
 - **You never need to run any update command manually — ever**
 
-> Your AI models, chat memory, notes, goals, and config are **never touched by updates.** Only the script file itself gets replaced.
+> Your AI models, chat memory, saved sessions, notes, goals, and config are **never touched by updates.** Only the script file itself gets replaced.
 
 ---
 
@@ -71,11 +74,6 @@ CYBER SH automatically detects your GPU **every single time** you launch it. No 
 CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --force-reinstall --break-system-packages
 ```
 After that, every run will automatically use your GPU with no extra steps.
-
-**Example of what you see on startup:**
-```
-✓ NVIDIA GPU: RTX 3060 (12GB VRAM) — CUDA ON ⚡
-```
 
 ---
 
@@ -115,7 +113,7 @@ python3 cybersh_direct.py --setup
 ```
 
 **The setup automatically:**
-- Detects your operating system and GPU
+- Detects your operating system, distro, and GPU
 - Installs the AI engine (`llama-cpp-python`)
 - Installs web search support (`ddgs`)
 - Lets you pick and download an AI model
@@ -191,13 +189,11 @@ wsl --install
 [5] 💬 Chat   — General assistant, ask it anything
 ```
 
-Switch modes any time by typing `/agent`, `/sec`, `/vibe`, `/code`, or `/chat`.
+Switch modes any time by typing `/agent`, `/sec`, `/vibe`, `/code`, or `/chat`. Every mode is tuned to give answers useful to both beginners and professionals at once.
 
 ---
 
 ### 🧠 Memory — AI remembers you between sessions
-
-The AI remembers things you tell it, even after you close and reopen the tool:
 
 ```
 /remember my name is Ahmed
@@ -210,9 +206,19 @@ The AI remembers things you tell it, even after you close and reopen the tool:
 
 ---
 
-### 🎭 AI Personalities
+### 💾 Sessions — save and reload full conversations
 
-Change how the AI talks and thinks:
+```
+/session save pentest-example-com   → save current chat with a name
+/session list                       → show all saved chats
+/session load 1                     → load and merge an old chat into current one
+/session search XSS                 → search across all saved chats for a keyword
+/session delete 2                   → delete a saved session
+```
+
+---
+
+### 🎭 AI Personalities
 
 ```
 /persona teacher    → explains everything simply, like a patient teacher
@@ -248,8 +254,20 @@ These use your internet connection directly — no middleman server:
 /cvesearch CVE-2024-1234
 → searches for vulnerability info and gives full security analysis
 
-/cvesearch apache log4j
-→ finds known CVEs and explains them
+/headers example.com
+→ checks HTTP security headers with Critical/Warning/Info severity tags
+
+/ipinfo
+→ shows your public IP, location, and ISP
+
+/ipinfo 8.8.8.8
+→ looks up info on any IP address
+
+/gitlog https://github.com/neo4-svg/cybersh
+→ fetches recent commits from any GitHub repo and summarizes them
+
+/gist <gist url or id>
+→ fetches and displays a GitHub Gist
 ```
 
 ---
@@ -263,9 +281,6 @@ These use your internet connection directly — no middleman server:
 /payload xss
 → ready-to-use XSS payloads: basic, encoded, polyglots, filter bypasses
 
-/payload sqli
-→ SQL injection payloads
-
 /cvesearch CVE-2024-1234
 → severity, affected versions, exploit method, mitigation steps
 
@@ -274,13 +289,37 @@ These use your internet connection directly — no middleman server:
 
 /ctf aGVsbG8gd29ybGQ=
 → analyzes CTF challenge data, identifies encodings, guides you to solve it
+
+/hash 5f4dcc3b5aa765d61d8327deb882cf99
+→ identifies hash type (MD5/SHA/bcrypt) and checks against common passwords
+
+/osint username123
+→ full OSINT checklist — platforms, tools, and legal techniques
+
+/wordlist company named TechCorp founded 2010 in London
+→ targeted, deduplicated password wordlist with realistic variation
+
+/pwcheck MyPassword123!
+→ real entropy-based strength check plus AI analysis
 ```
 
 ---
 
-### ⚡ Code tools
+### ⚡ Developer tools
 
 ```
+/debug
+→ paste broken code, AI finds every bug with line numbers and explains why
+
+/review
+→ full code review: bugs, security, performance, readability, score out of 10
+
+/template fastapi
+→ generates a complete production-ready project with file structure
+
+/gitlog
+→ summarizes your local repo's recent commits (run inside a git folder)
+
 /explaincode
 → paste any code, AI explains every single line in plain English
 
@@ -291,16 +330,16 @@ These use your internet connection directly — no middleman server:
 → paste any error message, get the exact fix
 
 /howto zip a folder
-→ get the exact Linux command for any task
+→ get the exact command for your OS — auto-detects your distro
 
 /tldr chmod 755
-→ plain English explanation of any Linux command
+→ plain English explanation of any command
 
 /regex match all email addresses
 → AI writes the regex pattern with examples and test cases
 
 /git undo last commit without losing changes
-→ exact git commands for anything you want to do
+→ exact git commands for anything you want to do, explained for beginners too
 
 /diff
 → paste a git diff, AI tells you what changed and any risks
@@ -314,29 +353,53 @@ These use your internet connection directly — no middleman server:
 
 ---
 
-### 🎯 Productivity tools
+### 🤖 AI thinking tools
 
 ```
-/goals
-→ show today's goals with a progress bar
+/think how does TLS handshake work
+→ AI shows its reasoning step by step before giving the final answer
 
-/goals add finish the login page
-→ add a goal for today
+/debate AI will replace programmers
+→ AI argues both sides fairly, then gives an honest verdict
 
-/goals done 1
-→ mark goal 1 as complete
+/improve
+→ paste any text, AI rewrites it clearer and explains every change
+
+/eli5 how does encryption work
+→ explains any topic using simple analogies, zero jargon
+```
+
+---
+
+### 🌍 Everyday tools
+
+```
+/convert 100 km to miles
+→ converts distance, temperature, weight, data size, time, speed
+
+/qr https://github.com/neo4-svg/cybersh
+→ generates a scannable QR code right in your terminal
+
+/speedtest
+→ tests your internet download speed and latency
 
 /calc 15% of 240
 → quick math (/calc 2**32 also works)
 
-/timer 25m
-→ countdown timer with live progress bar (also: /timer 30s, /timer 1h)
+/encode hello world
+→ shows Base64 + Hex + URL + MD5 + SHA1 + SHA256, auto-detects input type
 
-/note remember to test the API endpoint
-→ save a quick note to disk, persists between sessions
+/encode decode aGVsbG8gd29ybGQ=
+→ auto-detects encoding type and decodes it properly
 
-/notes list
-→ show all your saved notes
+/base 255
+→ converts a number between decimal, binary, octal, and hex
+
+/clock
+→ shows current time across major timezones
+
+/translate arabic How are you today
+→ instant clean translation, no repetition or looping
 
 /passgen
 → generate 3 strong passwords (16, 24, 32 chars)
@@ -344,29 +407,26 @@ These use your internet connection directly — no middleman server:
 /passgen phrase
 → generate passphrases like: ghost-vault-cipher-7291
 
-/passgen api
-→ generate a random 64-character API key
+/timer 25m
+→ countdown timer with live progress bar
 
-/encode hello world
-→ shows Base64 + Hex + URL + MD5 + SHA1 + SHA256 all at once
+/goals
+→ daily goal tracker with progress bar
 
-/encode decode aGVsbG8gd29ybGQ=
-→ decode Base64 back to text
+/note remember to test the API endpoint
+→ save a quick note, persists between sessions
 
 /benchmark
-→ tests CPU, RAM, and disk speed — gives a score and grade (S/A/B/C/D)
+→ tests CPU, RAM, disk speed — gives a score and grade (S/A/B/C/D)
 
 /syswatch
-→ live CPU / RAM / disk monitor that updates every second (Ctrl+C to stop)
-
-/translate arabic How are you today
-→ translates any text to any language
+→ live CPU / RAM / disk monitor, updates every second
 
 /recap
 → summary of everything you asked this session
 
 /tip
-→ shows a useful Linux tip (changes every day)
+→ a useful Linux tip, changes every day
 ```
 
 ---
@@ -384,7 +444,7 @@ These use your internet connection directly — no middleman server:
 → runs the last code block the AI wrote (asks your confirmation first)
 
 /copy
-→ copies the last AI response to your clipboard
+→ copies the last AI response to your clipboard — auto-detects Wayland, X11, macOS, or WSL
 ```
 
 ---
@@ -393,7 +453,8 @@ These use your internet connection directly — no middleman server:
 
 | Version | What was added |
 |---------|---------------|
-| **v1.2** | Full GPU auto-detection (NVIDIA/AMD/Intel) · auto-updater with OS detection · memory system · 9 AI personas · daily goals · `/calc` · `/summarize` · `/timer` · `/weather` · `/passgen` · `/encode` · `/benchmark` · `/syswatch` · `/explaincode` · `/roast` · `/regex` · `/git` · `/diff` · `/ctf` · `/rename` · `/challenge` · `/translate` · `/recap` · tab autocomplete · arrow key history |
+| **v1.3** | OS-aware AI responses (no more wrong package manager suggestions) · loop/repetition auto-detection · realistic entropy-based password checks · fixed clipboard auto-detection (Wayland/X11/macOS/WSL) · rewritten `/headers` with Critical/Warning/Info severity tags · deduplicated diverse `/wordlist` output · instant non-looping `/translate` · sessions system (`/session save/list/load/search/delete`) · `/convert` `/qr` `/speedtest` `/pwcheck` `/debug` `/review` `/template` `/gitlog` `/hash` `/headers` `/osint` `/wordlist` `/think` `/debate` `/improve` `/eli5` `/ipinfo` `/base` `/clock` `/lorem` `/gist` · every mode now balances beginner-friendly and professional-level detail |
+| **v1.2** | Full GPU auto-detection (NVIDIA/AMD/Intel) · auto-updater with OS detection · memory system · 9 AI personas · daily goals · `/calc` `/summarize` `/timer` `/weather` `/passgen` `/encode` `/benchmark` `/syswatch` `/explaincode` `/roast` `/regex` `/git` `/diff` `/ctf` `/rename` `/challenge` `/translate` `/recap` · tab autocomplete · arrow key history |
 | **v1.1** | Web search (`/web`, `/cvesearch`) · 7 downloadable models · in-app model downloader |
 | **v1.0** | Initial release — 5 modes · agent engine · file loading · chat history |
 
@@ -430,6 +491,9 @@ python3 cybersh_direct.py --setup
 pip install ddgs --break-system-packages
 ```
 
+**`/copy` not working:**
+The tool now auto-detects your display server and suggests the exact install command for your distro — just follow what it prints.
+
 **NVIDIA GPU not accelerating:**
 ```bash
 CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --force-reinstall --break-system-packages
@@ -446,6 +510,7 @@ CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --force-reinstall --bre
 | AI models | `~/ollama-models/` | ✅ Never touched |
 | Your memories | `~/.cybersh_memory.json` | ✅ Never touched |
 | Your config | `~/.cybersh_direct.json` | ✅ Never touched |
+| Your saved sessions | `~/.cybersh_sessions/` | ✅ Never touched |
 | Your notes | `~/.cybersh_notes.json` | ✅ Never touched |
 | Your goals | `~/.cybersh_goals.json` | ✅ Never touched |
 
