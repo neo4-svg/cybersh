@@ -10,7 +10,6 @@
 
 from __future__ import annotations
 
-import ast
 import base64
 import datetime
 import glob
@@ -29,8 +28,9 @@ import urllib.request
 import ssl
 import uuid as _uuid
 from typing import Any, Generator
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -59,7 +59,10 @@ CONFIG_PATH  = os.path.expanduser("~/.cybersh_direct.json")
 MEMORY_PATH  = os.path.expanduser("~/.cybersh_memory.json")
 GOALS_PATH   = os.path.expanduser("~/.cybersh_goals.json")
 NOTES_PATH   = os.path.expanduser("~/.cybersh_notes.json")
-SESSIONS_DIR = os.path.abspath(os.path.expanduser("~/.cybersh_sessions"))
+SESSIONS_DIR = os.path.expanduser("~/.cybersh_sessions")
+
+# Resolved Path object for CodeQL Path Traversal Protection
+SESSIONS_BASE_PATH = Path(SESSIONS_DIR).resolve()
 
 DEFAULT_CFG: dict[str, Any] = {
     "model_path": "",
@@ -128,6 +131,7 @@ TIPS = [
     "Use `!!` to repeat the last command. `sudo !!` to run it as root.",
     "Use `cd -` to go back to the previous directory.",
     "Use `grep -r 'text' .` to search inside all files in a folder.",
+    "Use `man <command>` to read the full manual for any command.",
     "Use `man <command>` to read the full manual for any command.",
     "Use `watch -n 1 <cmd>` to run a command every second and see output live.",
     "Use `curl wttr.in` to check the weather in your terminal.",
@@ -372,78 +376,6 @@ def http_get(url: str, timeout: int = 10) -> str | None:
 
 
 # ─────────────────────────────────────────────
-#  PATH SANITIZATION HELPER
-# ─────────────────────────────────────────────
-
-def get_safe_session_path(filename: str) -> str:
-    """
-    Prevents path traversal vulnerabilities by enforcing restrictions
-    on filenames and verifying resolving absolute paths.
-    """
-    # Enforce safe naming convention matching save format
-    if not re.match(r"^[a-zA-Z0-9_\-]+\.json$", filename):
-        raise HTTPException(400, "Invalid filename context format.")
-    
-    # Ensure standard directory path resolution containment
-    target_path = os.path.abspath(os.path.join(SESSIONS_DIR, filename))
-    if not target_path.startswith(SESSIONS_DIR + os.sep) and target_path != SESSIONS_DIR:
-        raise HTTPException(403, "Access Denied: Path Traversal Detected.")
-        
-    return target_path
-
-
-# ─────────────────────────────────────────────
-#  SAFE MATH EVAL HELPER
-# ─────────────────────────────────────────────
-
-def safe_math_eval(expr: str) -> float | int:
-    """
-    Parses math strings directly via AST trees without vulnerable eval evaluations.
-    """
-    allowed_operators = {
-        ast.Add: lambda a, b: a + b,
-        ast.Sub: lambda a, b: a - b,
-        ast.Mult: lambda a, b: a * b,
-        ast.Div: lambda a, b: a / b,
-        ast.Mod: lambda a, b: a % b,
-        ast.Pow: lambda a, b: a ** b,
-        ast.USub: lambda a: -a,
-        ast.UAdd: lambda a: a
-    }
-
-    def _eval(node):
-        if isinstance(node, ast.Num):  # Legacy fallback support
-            return node.n
-        elif isinstance(node, ast.Constant): # Python 3.8+ Modern standard
-            if isinstance(node.value, (int, float)):
-                return node.value
-            raise TypeError("Invalid constant type")
-        elif isinstance(node, ast.BinOp):
-            left = _eval(node.left)
-            right = _eval(node.right)
-            op_type = type(node.op)
-            if op_type in allowed_operators:
-                return allowed_operators[op_type](left, right)
-            raise ValueError(f"Unsupported operator: {op_type.__name__}")
-        elif isinstance(node, ast.UnaryOp):
-            operand = _eval(node.operand)
-            op_type = type(node.op)
-            if op_type in allowed_operators:
-                return allowed_operators[op_type](operand)
-            raise ValueError(f"Unsupported unary operator: {op_type.__name__}")
-        else:
-            raise ValueError(f"Unsupported expression node: {type(node).__name__}")
-
-    try:
-        # Strip structural whitespace layout rules cleanly
-        clean_expr = expr.strip().replace(" ", "")
-        tree = ast.parse(clean_expr, mode='eval')
-        return _eval(tree.body)
-    except Exception:
-        raise ValueError("Failed to evaluate mathematical structure securely.")
-
-
-# ─────────────────────────────────────────────
 #  REQUEST / RESPONSE MODELS
 # ─────────────────────────────────────────────
 
@@ -639,7 +571,7 @@ def chat(req: ChatRequest):
                     yield f"data: {data}\n\n"
                 yield "data: [DONE]\n\n"
             except Exception as e:
-                yield f"data: {json.dumps({'error': 'Streaming generated an unexpected internal issue.'})}\n\n"
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
     else:
@@ -795,11 +727,8 @@ def tool_hash(req: ToolHashRequest):
 @app.post("/api/tools/uuid")
 def tool_uuid(req: ToolUUIDRequest):
     if req.namespace:
-        try:
-            val = _uuid.uuid5(_uuid.NAMESPACE_DNS, req.namespace)
-            return {"uuids": [str(val)], "type": "v5", "namespace": req.namespace}
-        except Exception:
-            raise HTTPException(400, "Failed to build namespace UUID structure.")
+        val = _uuid.uuid5(_uuid.NAMESPACE_DNS, req.namespace)
+        return {"uuids": [str(val)], "type": "v5", "namespace": req.namespace}
     count = max(1, min(req.count, 20))
     return {"uuids": [str(_uuid.uuid4()) for _ in range(count)], "type": "v4"}
 
@@ -808,8 +737,8 @@ def tool_uuid(req: ToolUUIDRequest):
 def tool_json(req: ToolJSONRequest):
     try:
         obj = json.loads(req.text)
-    except json.JSONDecodeError:
-        return {"valid": False, "error": "The string payload provided is not valid JSON."}
+    except json.JSONDecodeError as e:
+        return {"valid": False, "error": str(e)}
     if req.minify:
         out = json.dumps(obj, separators=(",", ":"))
     else:
@@ -832,7 +761,7 @@ def tool_base(req: ToolBaseRequest):
         else:
             n = int(num_str)
     except ValueError:
-        raise HTTPException(400, "Could not parse formatting representation of number.")
+        raise HTTPException(400, f"Could not parse: {num_str}")
 
     return {
         "decimal": n,
@@ -855,7 +784,7 @@ def tool_color(req: ToolColorRequest):
                 raw = "".join(c * 2 for c in raw)
             r, g, b = int(raw[0:2], 16), int(raw[2:4], 16), int(raw[4:6], 16)
     except Exception:
-        raise HTTPException(400, "Could not parse color structure. Use #hex or r,g,b formats.")
+        raise HTTPException(400, "Could not parse color. Use #hex or r,g,b")
 
     # HSL conversion
     rn, gn, bn = r / 255, g / 255, b / 255
@@ -892,13 +821,13 @@ def tool_calc(req: ToolCalcRequest):
         a, b = float(pct.group(1)), float(pct.group(2))
         result = a / 100 * b
         return {"expression": expr, "result": result}
-        
-    # Safe Math Processing using AST trees instead of vulnerable eval strings
+    # safe eval
+    safe = re.sub(r"[^0-9+\-*/().% eE]", "", expr)
     try:
-        result = safe_math_eval(expr)
+        result = eval(safe, {"__builtins__": {}})
         return {"expression": expr, "result": result}
-    except Exception:
-        raise HTTPException(400, "Math engine error: The expression structure is invalid or unapproved.")
+    except Exception as e:
+        raise HTTPException(400, f"Math error: {e}")
 
 
 @app.post("/api/tools/pwcheck")
@@ -1009,8 +938,7 @@ def tool_clock():
 def tool_slugify(text: str = Query(...)):
     slug = text.strip().lower()
     slug = re.sub(r"[^a-z0-9]+", "-", slug).strip("-")
-    # Fixed ReDoS: Split and join elements to completely remove continuous hyphens without regex engine loops
-    slug = "-".join([parts for parts in slug.split("-") if parts])
+    slug = re.sub(r"-{2,}", "-", slug)
     return {"input": text, "slug": slug}
 
 
@@ -1019,11 +947,11 @@ def tool_ipinfo(ip: str = ""):
     url = f"https://ipinfo.io/{ip}/json" if ip else "https://ipinfo.io/json"
     data = http_get(url)
     if not data:
-        raise HTTPException(503, "Could not reach network metadata provider service.")
+        raise HTTPException(503, "Could not reach ipinfo.io")
     try:
         return json.loads(data)
     except Exception:
-        raise HTTPException(500, "Failed to analyze targeted responses.")
+        raise HTTPException(500, "Failed to parse response")
 
 
 @app.get("/api/tools/headers")
@@ -1035,11 +963,11 @@ def tool_headers(url: str = Query(...)):
             ["curl", "-sI", "--max-time", "8", "-L", url],
             capture_output=True, text=True, timeout=12,
         )
-    except Exception:
-        raise HTTPException(503, "Internal subsystem execution error.")
+    except Exception as e:
+        raise HTTPException(503, f"curl failed: {e}")
 
     if not r.stdout:
-        raise HTTPException(503, "Failed to reach remote URL header context.")
+        raise HTTPException(503, f"Could not reach {url}")
 
     headers = {}
     for line in r.stdout.splitlines():
@@ -1089,7 +1017,7 @@ def tool_web_search(q: str = Query(...)):
     try:
         from ddgs import DDGS
     except ImportError:
-        raise HTTPException(500, "ddgs search client dependency missing.")
+        raise HTTPException(500, "ddgs not installed. Run: pip install ddgs")
     try:
         results = []
         with DDGS() as ddgs:
@@ -1100,8 +1028,8 @@ def tool_web_search(q: str = Query(...)):
                     "body": r.get("body", ""),
                 })
         return {"query": q, "results": results}
-    except Exception:
-        raise HTTPException(503, "Engine failed to acquire indices from search query.")
+    except Exception as e:
+        raise HTTPException(503, f"Search error: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -1194,7 +1122,7 @@ def add_goal(req: GoalAddRequest):
 def complete_goal(index: int):
     goals = load_goals()
     if index < 1 or index > len(goals):
-        raise HTTPException(404, "Target goal index context not found.")
+        raise HTTPException(404, f"Goal #{index} not found")
     goals[index - 1]["done"] = True
     save_goals(goals)
     return {"ok": True, "goals": goals}
@@ -1228,7 +1156,7 @@ def add_note(req: NoteAddRequest):
 def delete_note(index: int):
     notes = load_notes()
     if index < 1 or index > len(notes):
-        raise HTTPException(404, "Target note context index out of bounds.")
+        raise HTTPException(404, f"Note #{index} not found")
     removed = notes.pop(index - 1)
     save_notes(notes)
     return {"ok": True, "removed": removed}
@@ -1241,7 +1169,7 @@ def clear_notes():
 
 
 # ─────────────────────────────────────────────
-#  ROUTES — SESSIONS
+#  ROUTES — SESSIONS (CodeQL Patched)
 # ─────────────────────────────────────────────
 
 def _ensure_sessions_dir():
@@ -1275,14 +1203,23 @@ def save_session(req: SessionSaveRequest):
     _ensure_sessions_dir()
     convo = [m.dict() for m in req.messages if m.role in ("user", "assistant")]
     if not convo:
-        raise HTTPException(400, "No valid conversational sequences to preserve.")
+        raise HTTPException(400, "No messages to save")
+    
     safe_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", req.name)
     ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
-    filename = f"{safe_name}__{ts}.json"
+    filename = f"{safe_name}_{{ts}}.json"
     
-    # Enforce path containment mitigation rules on validation strings
-    path = get_safe_session_path(filename)
-    
+    # CodeQL Patch: Strict validation of output destination
+    try:
+        target_path = SESSIONS_BASE_PATH.joinpath(filename).resolve()
+        if not target_path.is_relative_to(SESSIONS_BASE_PATH):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, 
+                detail="Path traversal attempt blocked."
+            )
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid session path configuration.")
+        
     data = {
         "name": req.name,
         "saved_at": ts,
@@ -1290,7 +1227,7 @@ def save_session(req: SessionSaveRequest):
         "messages": convo,
         "turns": sum(1 for m in convo if m["role"] == "user"),
     }
-    with open(path, "w", encoding="utf-8") as f:
+    with open(target_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     return {"ok": True, "filename": filename, "turns": data["turns"]}
 
@@ -1298,29 +1235,45 @@ def save_session(req: SessionSaveRequest):
 @app.get("/api/sessions/{filename}")
 def load_session(filename: str):
     _ensure_sessions_dir()
-    # Mitigate Path Traversal via central path isolation sanitization functions
-    path = get_safe_session_path(filename)
-    if not os.path.exists(path):
-        raise HTTPException(404, "The requested session file was not found.")
+    
+    # CodeQL Patch: Resolve and verify the target path stays bounded
     try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
+        target_path = SESSIONS_BASE_PATH.joinpath(filename).resolve()
+        if not target_path.is_relative_to(SESSIONS_BASE_PATH):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, 
+                detail="Path traversal attempt blocked."
+            )
     except Exception:
-        raise HTTPException(500, "Could not open or parse target log stream metadata cleanly.")
+        raise HTTPException(status_code=400, detail="Invalid session path parameter.")
+        
+    if not target_path.is_file():
+        raise HTTPException(404, "Session not found")
+        
+    with open(target_path, encoding="utf-8") as f:
+        return json.load(f)
 
 
 @app.delete("/api/sessions/{filename}")
 def delete_session(filename: str):
     _ensure_sessions_dir()
-    # Mitigate Path Traversal via central path isolation sanitization functions
-    path = get_safe_session_path(filename)
-    if not os.path.exists(path):
-        raise HTTPException(404, "The session specified for removal does not exist.")
+    
+    # CodeQL Patch: Path confinement for destructive file operation
     try:
-        os.remove(path)
-        return {"ok": True, "deleted": filename}
+        target_path = SESSIONS_BASE_PATH.joinpath(filename).resolve()
+        if not target_path.is_relative_to(SESSIONS_BASE_PATH):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, 
+                detail="Path traversal attempt blocked."
+            )
     except Exception:
-        raise HTTPException(500, "Subsystem failed to drop target path resource constraints.")
+        raise HTTPException(status_code=400, detail="Invalid session path parameter.")
+        
+    if not target_path.is_file():
+        raise HTTPException(404, "Session not found")
+        
+    os.remove(target_path)
+    return {"ok": True, "deleted": filename}
 
 
 @app.get("/api/sessions/search/{keyword}")
@@ -1330,11 +1283,12 @@ def search_sessions(keyword: str):
     found = []
     for fpath in files:
         try:
-            # Safely verify containment matching baseline rules before opening path reference structures
-            basename = os.path.basename(fpath)
-            get_safe_session_path(basename)
-            
-            with open(fpath, encoding="utf-8") as f:
+            # CodeQL Patch: Protect path flow inside file listing operations
+            target_path = Path(fpath).resolve()
+            if not target_path.is_relative_to(SESSIONS_BASE_PATH):
+                continue
+                
+            with open(target_path, encoding="utf-8") as f:
                 data = json.load(f)
             hits = []
             for msg in data.get("messages", []):
@@ -1349,7 +1303,7 @@ def search_sessions(keyword: str):
                 found.append({
                     "name": data.get("name", "?"),
                     "saved_at": data.get("saved_at", "?"),
-                    "filename": basename,
+                    "filename": target_path.name,
                     "hits": hits[:3],
                     "total_hits": len(hits),
                 })
