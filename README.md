@@ -12,13 +12,75 @@
 **CYBER SH — Your Personal Offline AI Assistant**  
 Runs entirely on your own computer. No cloud. No subscriptions. No one watching.
 
-![Version](https://img.shields.io/badge/version-1.4-brightgreen)
+![Version](https://img.shields.io/badge/version-1.5-brightgreen)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-orange)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows%20WSL-lightgrey)
 ![Security](https://img.shields.io/badge/security-audited%20v1.4-blue)
 
 </div>
+
+---
+
+## 🆕 v1.5 — New Features
+
+### `/image` — AI Image Generation (Stable Diffusion, local)
+
+Generate images from text prompts entirely on your own machine using Stable Diffusion via `diffusers`. No API key, no cloud, no cost per image. Images are saved as `.png` files in the same folder as the script.
+
+```
+/image a neon cyberpunk city at night
+/image portrait of a hacker, cinematic lighting --steps 30 --size 512x768
+/image fantasy castle --neg blurry, ugly, low quality
+```
+
+**Options you can append to any prompt:**
+
+| Option | Default | What it does |
+|--------|---------|-------------|
+| `--steps N` | 20 | More steps = better quality, slower |
+| `--size WxH` | 512x512 | Output resolution e.g. `768x512` |
+| `--model <id>` | `runwayml/stable-diffusion-v1-5` | Any HuggingFace SD model ID |
+| `--neg <text>` | `blurry, ugly…` | Things to avoid in the image |
+
+- Automatically uses **CUDA GPU** if available (fp16, fast), falls back to CPU (fp32, slower)
+- `diffusers` is auto-installed on first use — no manual setup
+- Output filename: `cybersh_img_<prompt>_<timestamp>.png`
+
+---
+
+### `/fetch` — Persistent Web Agent
+
+Fetch any URL, save it to a local database, and let the AI answer questions about its content. Unlike `/web` (which searches the web), `/fetch` retrieves a specific page and **remembers it** — so any time you mention that site or domain in conversation, cybersh silently fetches a fresh snapshot and injects it as AI context automatically.
+
+```
+/fetch https://railway.com
+/fetch https://api.example.com/docs what are the available endpoints?
+```
+
+**Auth support — for sites that require login:**
+
+```
+/fetchauth https://example.com
+```
+
+Supports three auth types:
+- **Cookie** — paste the `Cookie:` header from your browser's DevTools
+- **Bearer token** — paste your API token
+- **Basic auth** — username + password
+
+Auth is stored in `cybersh_webagent.json` in your script folder (plain JSON, TinyDB).
+
+**Other fetch commands:**
+
+```
+/fetchsites              → list all saved sites and their auth type
+/fetchforget <url>       → remove a site from the database
+```
+
+**Auto-inject magic:** Once a site is saved, you never need to re-run `/fetch`. Just mention the URL or domain in any message and cybersh will automatically fetch a live snapshot and give it to the AI as context before answering.
+
+> **Note:** `cybersh_webagent.json` is created next to the script on first use. It is never touched by updates.
 
 ---
 
@@ -44,9 +106,9 @@ The `/remember` command help text previously said "AI remembers this forever", w
 A section of `session_save` used `chr(109)+chr(101)+...` to spell out dictionary key names — the kind of pattern that triggers red flags in automated security scanners and makes the code look like it is hiding something. It was not malicious, but it was unnecessary and hurt trust. All obfuscated strings are now plain text.
 
 **6. Downloaded model SHA-256 verification (Important)**  
-Models downloaded via `/models` or `--setup` are now verified against a SHA-256 checksum after download. A corrupted download or a tampered file will be detected and deleted automatically. Checksums will be published and kept up to date in the repo as model providers publish them.
+Models downloaded via `/models` or `--setup` are now verified against a SHA-256 checksum after download. A corrupted download or a tampered file will be detected and deleted automatically.
 
-> **How to get v1.4:** Just run the tool — the auto-updater handles it. Or pull the repo manually: `git pull && python3 cybersh_direct.py`
+> **How to get v1.4/v1.5:** Just run the tool — the auto-updater handles it. Or pull the repo manually: `git pull && python3 cybersh_direct.py`
 
 ---
 
@@ -59,6 +121,8 @@ Models downloaded via `/models` or `--setup` are now verified against a SHA-256 
 | AI chat, all modes | ❌ No |
 | Memory, personas, goals, sessions | ❌ No |
 | Code help, file analysis | ❌ No |
+| `/image` — local image generation | ❌ No (after first model download) |
+| `/fetch` — fetch & save a URL | ✅ Yes |
 | `/web` — web search | ✅ Yes |
 | `/weather` — weather | ✅ Yes |
 | `/summarize` — read a URL | ✅ Yes |
@@ -68,7 +132,7 @@ Models downloaded via `/models` or `--setup` are now verified against a SHA-256 
 | `/speedtest` | ✅ Yes |
 | Auto-update on startup | ✅ Yes (skipped automatically if offline) |
 
-> **Privacy note:** When you use any internet feature, the request goes directly from **your computer** to the relevant service (DuckDuckGo, GitHub, wttr.in, etc.). It never passes through any third-party server or CYBER SH infrastructure. Your queries are yours alone.
+> **Privacy note:** When you use any internet feature, the request goes directly from **your computer** to the relevant service. It never passes through any third-party server or CYBER SH infrastructure.
 
 ---
 
@@ -81,7 +145,7 @@ CYBER SH **updates itself automatically every time you run it.**
 - If you are offline, it simply skips the check and continues normally
 - **You never need to run any update command manually — ever**
 
-> Your AI models, chat memory, saved sessions, notes, goals, and config are **never touched by updates.** Only the script file itself gets replaced.
+> Your AI models, chat memory, saved sessions, notes, goals, config, and `cybersh_webagent.json` are **never touched by updates.** Only the script file itself gets replaced.
 
 ---
 
@@ -91,7 +155,7 @@ CYBER SH automatically detects your GPU **every single time** you launch it. No 
 
 | GPU | What happens |
 |-----|-------------|
-| **NVIDIA** + CUDA installed | ✅ Full GPU acceleration — faster responses |
+| **NVIDIA** + CUDA installed | ✅ Full GPU acceleration — faster responses + image generation |
 | **NVIDIA** without CUDA | Shows you one command to enable it, runs on CPU until then |
 | **AMD** | Detected and shown, runs on CPU (ROCm experimental) |
 | **Intel Arc / iGPU** | Detected and shown, runs on CPU |
@@ -101,7 +165,7 @@ CYBER SH automatically detects your GPU **every single time** you launch it. No 
 ```bash
 CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --force-reinstall --break-system-packages
 ```
-After that, every run will automatically use your GPU with no extra steps.
+After that, every run will automatically use your GPU — including `/image` generation.
 
 ---
 
@@ -274,6 +338,31 @@ Switch modes any time by typing `/agent`, `/sec`, `/vibe`, `/code`, or `/chat`.
 
 ---
 
+### 🖼️ Image Generation (new in v1.5)
+
+```
+/image a neon cyberpunk city at night
+/image a portrait of a hacker --steps 30
+/image fantasy castle --size 768x512 --neg blurry, ugly
+/image --model stabilityai/stable-diffusion-2-1 futuristic terminal
+```
+
+---
+
+### 🌐 Web Agent — persistent site memory (new in v1.5)
+
+```
+/fetch https://railway.com                         → fetch and save the site
+/fetch https://docs.example.com what is the API?  → fetch and ask AI about it
+/fetchauth https://example.com                     → add auth (cookie/bearer/basic)
+/fetchsites                                        → list all saved sites
+/fetchforget https://example.com                   → remove a saved site
+```
+
+Once a site is saved, just mention it naturally — cybersh auto-fetches and injects it as context.
+
+---
+
 ### 🔐 Security tools
 
 ```
@@ -361,6 +450,7 @@ Switch modes any time by typing `/agent`, `/sec`, `/vibe`, `/code`, or `/chat`.
 
 | Version | What was added |
 |---------|---------------|
+| **v1.5** | **`/image`** — local Stable Diffusion image generation, saves `.png` next to script, auto GPU/CPU, supports `--steps`, `--size`, `--model`, `--neg` · **`/fetch`** — persistent web agent with TinyDB storage, auto-injects saved site content into AI context · **`/fetchauth`** — cookie / bearer / basic auth for saved sites · **`/fetchsites`** / **`/fetchforget`** — manage saved sites |
 | **v1.4** | **Security release** — TLS certificate verification restored · auto-updater SHA-256 checksum verification against published manifest · atomic update writes (crash-safe) · memory plain-text storage warning · obfuscated `chr()` code removed · downloaded model SHA-256 verification |
 | **v1.3** | OS-aware AI responses · loop/repetition auto-detection · entropy-based password checks · clipboard auto-detection (Wayland/X11/macOS/WSL) · rewritten `/headers` with severity tags · sessions system · `/convert` `/qr` `/speedtest` `/pwcheck` `/debug` `/review` `/template` `/gitlog` `/hash` `/osint` `/wordlist` `/think` `/debate` `/improve` `/eli5` `/ipinfo` `/base` `/clock` `/lorem` `/gist` |
 | **v1.2** | Full GPU auto-detection · auto-updater · memory system · 9 AI personas · daily goals · `/calc` `/summarize` `/timer` `/weather` `/passgen` `/encode` `/benchmark` `/syswatch` · tab autocomplete · arrow key history |
@@ -399,7 +489,17 @@ python3 cybersh_direct.py --setup
 pip install ddgs --break-system-packages
 ```
 
-**`/copy` not working:**
+**`/image` fails to install diffusers:**
+```bash
+pip install diffusers transformers accelerate safetensors --break-system-packages
+```
+
+**`/fetch` fails — site needs auth:**
+```
+/fetchauth https://yoursite.com
+```
+
+**`/copy` not working:**  
 The tool auto-detects your display server and prints the exact install command for your distro.
 
 **NVIDIA GPU not accelerating:**
@@ -414,6 +514,7 @@ CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --force-reinstall --bre
 | File | Location | Safe from updates? |
 |------|----------|--------------------|
 | `cybersh_direct.py` | your cybersh folder | 🔄 Replaced (SHA-256 verified since v1.4) |
+| `cybersh_webagent.json` | your cybersh folder | ✅ Never touched |
 | AI models | `~/ollama-models/` | ✅ Never touched |
 | Your memories | `~/.cybersh_memory.json` | ✅ Never touched |
 | Your config | `~/.cybersh_direct.json` | ✅ Never touched |
