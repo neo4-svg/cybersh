@@ -6,3 +6,16 @@ llama-cpp-python
 
 # Web search — enables /web and /cvesearch commands (recommended)
 ddgs
+
+# Web agent — enables /fetch, /fetchauth, /fetchsites, /fetchforget (recommended)
+tinydb
+
+# Image generation — enables /image command (optional, ~4GB model download on first use)
+diffusers
+transformers
+accelerate
+safetensors
+
+# Browser-based scraping — enables /fetch on JS-heavy sites like X.com, Instagram (optional)
+# After install run: playwright install chromium
+playwright
