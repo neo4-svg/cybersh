@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# version: 1.4
+# version: 1.5
 """
  ██████╗██╗   ██╗██████╗ ███████╗██████╗     ███████╗██╗  ██╗
 ██╔════╝╚██╗ ██╔╝██╔══██╗██╔════╝██╔══██╗    ██╔════╝██║  ██║
@@ -330,7 +330,8 @@ ALL_COMMANDS = [
     "/hash","/headers","/osint","/wordlist",
     "/think","/debate","/improve","/eli5",
     "/uuid","/cheatsheet","/json","/base","/color","/slugify","/lorem",
-    "/countdown","/ip","/clock","/gist","/cron","/quiz","/name",
+    "/countdown","/ip","/clock","/gist","/cron","/quiz","/name","/image",
+    "/fetch","/fetchauth","/fetchsites","/fetchforget",
     "--update","--no-update",
 ]
 
@@ -1317,6 +1318,11 @@ def print_help() -> None:
             ("/ip [address]",            "IP geolocation lookup (yours or any IP)"),
             ("/clock [+offset]",         "World clock across timezones"),
             ("/gist <url|id>",           "Fetch + display a GitHub Gist"),
+            ("/image <prompt>",          "Generate image with Stable Diffusion → saves .png"),
+            ("/fetch <url> [task]",        "Fetch URL, save it, ask AI about it"),
+            ("/fetchauth <url>",           "Add/update auth (cookie/bearer/basic) for a site"),
+            ("/fetchsites",               "List all saved sites"),
+            ("/fetchforget <url>",         "Remove a saved site"),
         ]),
         ("👨‍💻 DEVELOPER", [
             ("/debug",                   "Paste broken code, AI finds every bug"),
@@ -3371,6 +3377,447 @@ def setup_wizard(cfg: dict) -> None:
     print(f"  Run: {NEON_C}python3 {sys.argv[0]}{R}\n")
 
 # ══════════════════════════════════════════════════════════════
+#  IMAGE GENERATION — Stable Diffusion via diffusers (CPU/GPU)
+# ══════════════════════════════════════════════════════════════
+
+def cmd_image(arg: str) -> None:
+    """Generate an image from a text prompt using Stable Diffusion (diffusers).
+    Saves as .png in the same directory as this script.
+    Usage: /image <prompt>
+    Options you can append to prompt:
+      --steps N      number of inference steps (default 20)
+      --size WxH     output resolution, e.g. 512x512 (default 512x512)
+      --model <id>   HuggingFace model id (default: runwayml/stable-diffusion-v1-5)
+      --neg <text>   negative prompt (things to avoid)
+    """
+    if not arg:
+        print(f"\n{NEON_Y}Usage: /image <prompt> [options]")
+        print(f"  Options:")
+        print(f"    --steps N       inference steps (default 20, more = better quality)")
+        print(f"    --size WxH      e.g. 512x512 or 768x512 (default 512x512)")
+        print(f"    --model <id>    HuggingFace model ID")
+        print(f"    --neg <text>    negative prompt")
+        print(f"  Examples:")
+        print(f"    /image a neon cyberpunk city at night")
+        print(f"    /image a portrait of a hacker --steps 30 --size 512x768")
+        print(f"    /image fantasy castle --neg blurry, ugly, low quality{R}\n")
+        return
+
+    # ── parse flags out of the prompt ────────────────────────
+    steps     = 20
+    width     = 512
+    height    = 512
+    model_id  = "runwayml/stable-diffusion-v1-5"
+    neg_prompt = "blurry, ugly, low quality, watermark, text, deformed"
+    prompt    = arg
+
+    import re as _re
+    def _extract(flag, default, cast=str):
+        nonlocal prompt
+        m = _re.search(rf"{flag}\s+(\S+)", prompt)
+        if m:
+            prompt = prompt.replace(m.group(0), "").strip()
+            try: return cast(m.group(1))
+            except: pass
+        return default
+
+    steps    = _extract("--steps",  20,    int)
+    model_id = _extract("--model",  model_id, str)
+
+    size_m = _re.search(r"--size\s+(\d+)x(\d+)", prompt)
+    if size_m:
+        width  = int(size_m.group(1))
+        height = int(size_m.group(2))
+        prompt = prompt.replace(size_m.group(0), "").strip()
+
+    neg_m = _re.search(r"--neg\s+(.+?)(?=--|$)", prompt)
+    if neg_m:
+        neg_prompt = neg_m.group(1).strip()
+        prompt = prompt.replace(neg_m.group(0), "").strip()
+
+    prompt = prompt.strip()
+    if not prompt:
+        print(f"{NEON_R}✗ Prompt cannot be empty.{R}\n"); return
+
+    # ── check / install diffusers ─────────────────────────────
+    try:
+        import torch
+        from diffusers import StableDiffusionPipeline
+    except ImportError:
+        print(f"\n{NEON_Y}📦 diffusers not installed — installing now…{R}\n")
+        _install_packages(["diffusers", "transformers", "accelerate", "safetensors"])
+        try:
+            import torch
+            from diffusers import StableDiffusionPipeline
+        except ImportError:
+            print(f"{NEON_R}✗ Could not import diffusers after install.")
+            print(f"  Manual fix: pip install diffusers transformers accelerate safetensors --break-system-packages{R}\n")
+            return
+
+    # ── determine device ──────────────────────────────────────
+    device = "cpu"
+    dtype  = torch.float32
+    if torch.cuda.is_available():
+        device = "cuda"
+        dtype  = torch.float16
+        gpu_name = torch.cuda.get_device_name(0)
+        print(f"\n{NEON_G}✓ CUDA GPU: {gpu_name} — using GPU acceleration ⚡{R}")
+    else:
+        print(f"\n{DIM}  No CUDA GPU found — running on CPU (this will be slow){R}")
+
+    w = min(shutil.get_terminal_size((80, 24)).columns, 65)
+    dline = f"{NEON_C}{'─'*w}{R}"
+    print(f"\n{dline}")
+    print(f"{NEON_C}{BOLD}  🎨 Image Generation{R}")
+    print(dline)
+    print(f"  {NEON_Y}Prompt:{R}  {prompt}")
+    print(f"  {NEON_Y}Size:  {R}  {width}×{height}")
+    print(f"  {NEON_Y}Steps: {R}  {steps}")
+    print(f"  {NEON_Y}Model: {R}  {DIM}{model_id}{R}")
+    print(f"  {NEON_Y}Device:{R}  {device.upper()}")
+    print(dline)
+
+    # ── load pipeline (cached after first load) ───────────────
+    print(f"\n{DIM}  Loading model (first run downloads ~4GB)…{R}")
+    try:
+        pipe = StableDiffusionPipeline.from_pretrained(
+            model_id,
+            torch_dtype=dtype,
+            safety_checker=None,     # let the user manage content locally
+        )
+        pipe = pipe.to(device)
+        if device == "cpu":
+            pipe.enable_attention_slicing()   # saves RAM on CPU
+    except Exception as e:
+        print(f"\n{NEON_R}✗ Failed to load model: {e}{R}\n")
+        return
+
+    # ── generate ──────────────────────────────────────────────
+    print(f"\n{NEON_C}  Generating image… {DIM}(Ctrl+C to cancel){R}\n")
+    import time as _time
+    t0 = _time.time()
+    try:
+        result = pipe(
+            prompt,
+            negative_prompt   = neg_prompt,
+            num_inference_steps = steps,
+            width             = width,
+            height            = height,
+        )
+        image = result.images[0]
+    except KeyboardInterrupt:
+        print(f"\n{NEON_Y}  Generation cancelled.{R}\n")
+        return
+    except Exception as e:
+        print(f"\n{NEON_R}✗ Generation error: {e}{R}\n")
+        return
+
+    elapsed = _time.time() - t0
+
+    # ── save .png in same dir as this script ──────────────────
+    import re as _re2, datetime as _dt
+    script_dir = os.path.dirname(os.path.realpath(os.path.abspath(__file__)))
+    safe_name  = _re2.sub(r"[^a-zA-Z0-9]+", "_", prompt[:40]).strip("_")
+    ts_str     = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename   = f"cybersh_img_{safe_name}_{ts_str}.png"
+    out_path   = os.path.join(script_dir, filename)
+
+    try:
+        image.save(out_path)
+    except Exception as e:
+        print(f"{NEON_R}✗ Could not save image: {e}{R}\n")
+        return
+
+    print(f"\n{dline}")
+    print(f"{NEON_G}{BOLD}  ✓ Image saved!{R}")
+    print(f"  {NEON_C}Path:{R}  {out_path}")
+    print(f"  {NEON_C}Size:{R}  {width}×{height} px")
+    print(f"  {NEON_C}Time:{R}  {elapsed:.1f}s")
+    print(f"{dline}\n")
+
+
+# ══════════════════════════════════════════════════════════════
+#  WEB AGENT — persistent site memory + auth (TinyDB)
+# ══════════════════════════════════════════════════════════════
+#
+#  Commands:
+#    /fetch <url> [task]     — fetch URL (save it), optionally ask AI about it
+#    /fetchauth <url>        — add / update auth for a saved site
+#    /fetchsites             — list all saved sites
+#    /fetchforget <url>      — remove a saved site
+#
+#  When the AI is asked anything mentioning a saved URL (or its domain),
+#  cybersh auto-fetches a fresh snapshot and injects it as context.
+# ══════════════════════════════════════════════════════════════
+
+import sqlite3 as _sqlite3  # only used for type hint — actual store is TinyDB
+
+def _wa_db():
+    """Return a TinyDB instance, auto-creating the file next to this script."""
+    try:
+        from tinydb import TinyDB
+    except ImportError:
+        _install_packages(["tinydb"])
+        from tinydb import TinyDB
+    script_dir = os.path.dirname(os.path.realpath(os.path.abspath(__file__)))
+    db_path = os.path.join(script_dir, "cybersh_webagent.json")
+    return TinyDB(db_path)
+
+def _wa_fetch(url: str, auth: dict | None = None) -> tuple[int, str]:
+    """Fetch URL with optional auth. Returns (status_code, text)."""
+    import urllib.request as _ur, urllib.error as _ue, ssl as _ssl
+    ctx = _ssl.create_default_context()
+    headers = {"User-Agent": "Mozilla/5.0 (CyberSH WebAgent)"}
+    if auth:
+        atype = auth.get("type", "")
+        if atype == "bearer":
+            headers["Authorization"] = f"Bearer {auth['value']}"
+        elif atype == "basic":
+            import base64 as _b64
+            creds = _b64.b64encode(f"{auth['user']}:{auth['pass']}".encode()).decode()
+            headers["Authorization"] = f"Basic {creds}"
+        elif atype == "cookie":
+            headers["Cookie"] = auth["value"]
+    req = _ur.Request(url, headers=headers)
+    try:
+        with _ur.urlopen(req, timeout=15, context=ctx) as r:
+            ct = r.headers.get_content_type() or ""
+            raw = r.read()
+            if "html" in ct:
+                # strip tags for readability
+                import re as _re
+                text = raw.decode("utf-8", errors="replace")
+                text = _re.sub(r"<script[^>]*>.*?</script>", "", text, flags=_re.S)
+                text = _re.sub(r"<style[^>]*>.*?</style>",  "", text, flags=_re.S)
+                text = _re.sub(r"<[^>]+>", " ", text)
+                text = _re.sub(r"[ \t]{2,}", " ", text)
+                text = "\n".join(l.strip() for l in text.splitlines() if l.strip())
+                return 200, text[:12000]
+            else:
+                return 200, raw.decode("utf-8", errors="replace")[:12000]
+    except _ue.HTTPError as e:
+        return e.code, str(e)
+    except Exception as e:
+        return 0, str(e)
+
+def _wa_find(url: str):
+    """Return TinyDB record matching url or its domain, or None."""
+    from tinydb import Query
+    db  = _wa_db()
+    W   = Query()
+    rec = db.get(W.url == url)
+    if rec:
+        return rec
+    # try domain match
+    import re as _re
+    m = _re.match(r"https?://([^/]+)", url)
+    if m:
+        domain = m.group(1)
+        rec = db.get(W.domain == domain)
+    return rec
+
+def cmd_web(arg: str, cfg: dict, messages: list, session_msgs: list) -> str:
+    """
+    /fetch <url> [task]
+    Fetch a URL, persist it in the agent DB, optionally ask the AI a question about it.
+    """
+    if not arg:
+        print(f"\n{NEON_Y}Usage: /fetch <url> [task/question]")
+        print(f"  Examples:")
+        print(f"    /fetch https://example.com")
+        print(f"    /fetch https://example.com summarise the main content")
+        print(f"    /fetch https://api.example.com/data what are the available endpoints?{R}\n")
+        return ""
+
+    parts  = arg.split(None, 1)
+    url    = parts[0]
+    task   = parts[1] if len(parts) > 1 else ""
+
+    if not url.startswith("http"):
+        url = "https://" + url
+
+    import re as _re
+    m      = _re.match(r"https?://([^/]+)", url)
+    domain = m.group(1) if m else url
+
+    w = min(shutil.get_terminal_size((80, 24)).columns, 65)
+    dline = f"{NEON_C}{'─'*w}{R}"
+    print(f"\n{dline}")
+    print(f"{NEON_C}{BOLD}  🌐 Web Agent{R}")
+    print(dline)
+    print(f"  {NEON_Y}URL:{R} {url}")
+
+    # check for saved auth
+    existing = _wa_find(url)
+    auth     = existing.get("auth") if existing else None
+
+    print(f"  {NEON_Y}Auth:{R} {DIM}{auth['type'] if auth else 'none'}{R}")
+    print(f"  {DIM}Fetching…{R}")
+
+    status, content = _wa_fetch(url, auth)
+
+    if status == 401 or status == 403:
+        print(f"\n{NEON_Y}  ⚠  Status {status} — site requires authentication.")
+        print(f"  Run: {NEON_C}/fetchauth {url}{R} to add credentials.\n")
+        # still save the URL so next /fetch auto-prompts
+        _wa_save(url, domain, auth=None)
+        return ""
+
+    if status == 0 or status >= 400:
+        print(f"\n{NEON_R}  ✗ Fetch failed (status {status}): {content}{R}\n")
+        return ""
+
+    print(f"  {NEON_G}✓ Fetched {len(content)} chars (status {status}){R}")
+    print(dline)
+
+    # persist / update
+    _wa_save(url, domain, auth)
+
+    if not task:
+        # just show a short preview
+        preview = content[:800].replace("\n", " ")
+        print(f"\n{DIM}{preview}…{R}\n")
+        print(f"{NEON_C}  Tip: /fetch {url} <your question> to ask the AI about this page{R}\n")
+        return ""
+
+    # ask AI with page content injected as context
+    context_prompt = (
+        f"The user fetched this webpage ({url}).\n"
+        f"Here is the page content (truncated to 12 000 chars):\n\n"
+        f"---\n{content}\n---\n\n"
+        f"User task: {task}"
+    )
+    print(f"\n{NEON_C}  Asking AI about this page…{R}\n")
+    return ask(cfg, messages, session_msgs, context_prompt)
+
+
+def _wa_save(url: str, domain: str, auth):
+    """Upsert a site record in TinyDB."""
+    from tinydb import Query
+    db  = _wa_db()
+    W   = Query()
+    rec = db.get(W.url == url)
+    data = {"url": url, "domain": domain, "auth": auth}
+    if rec:
+        db.update(data, W.url == url)
+    else:
+        db.insert(data)
+
+
+def cmd_webauth(arg: str) -> None:
+    """/fetchauth <url> — add or update authentication for a saved site."""
+    if not arg:
+        print(f"\n{NEON_Y}Usage: /fetchauth <url>{R}\n"); return
+
+    url = arg.strip()
+    if not url.startswith("http"):
+        url = "https://" + url
+
+    import re as _re
+    m      = _re.match(r"https?://([^/]+)", url)
+    domain = m.group(1) if m else url
+
+    w = min(shutil.get_terminal_size((80, 24)).columns, 65)
+    dline = f"{NEON_C}{'─'*w}{R}"
+    print(f"\n{dline}")
+    print(f"{NEON_C}{BOLD}  🔐 Web Auth Setup — {domain}{R}")
+    print(dline)
+    print(f"  {NEON_Y}1{R}  Cookie  (paste Cookie: header from browser DevTools)")
+    print(f"  {NEON_Y}2{R}  Bearer token")
+    print(f"  {NEON_Y}3{R}  Basic auth (username + password)")
+    print(f"  {NEON_Y}0{R}  Remove auth")
+    choice = input(f"\n  {NEON_C}Choose [{NEON_Y}1/2/3/0{NEON_C}]: {R}").strip()
+
+    auth = None
+    if choice == "1":
+        val = input(f"  {NEON_C}Paste cookie value: {R}").strip()
+        auth = {"type": "cookie", "value": val}
+    elif choice == "2":
+        val = input(f"  {NEON_C}Paste bearer token: {R}").strip()
+        auth = {"type": "bearer", "value": val}
+    elif choice == "3":
+        u = input(f"  {NEON_C}Username: {R}").strip()
+        p = input(f"  {NEON_C}Password: {R}").strip()
+        auth = {"type": "basic", "user": u, "pass": p}
+    elif choice == "0":
+        auth = None
+        print(f"  {NEON_Y}Auth removed.{R}")
+    else:
+        print(f"  {NEON_R}Invalid choice — cancelled.{R}\n"); return
+
+    _wa_save(url, domain, auth)
+    print(f"\n  {NEON_G}✓ Auth saved for {domain}{R}")
+    print(dline + "\n")
+
+
+def cmd_websites() -> None:
+    """/fetchsites — list all sites saved in the web agent DB."""
+    from tinydb import Query
+    db   = _wa_db()
+    rows = db.all()
+    w    = min(shutil.get_terminal_size((80, 24)).columns, 65)
+    dline = f"{NEON_C}{'─'*w}{R}"
+    print(f"\n{dline}")
+    print(f"{NEON_C}{BOLD}  🌐 Saved Sites ({len(rows)}){R}")
+    print(dline)
+    if not rows:
+        print(f"  {DIM}No sites saved yet. Use /fetch <url> to add one.{R}")
+    for r in rows:
+        auth_label = r["auth"]["type"] if r.get("auth") else "no auth"
+        print(f"  {NEON_Y}•{R} {r['url']}  {DIM}[{auth_label}]{R}")
+    print(dline + "\n")
+
+
+def cmd_webforget(arg: str) -> None:
+    """/fetchforget <url> — remove a site from the web agent DB."""
+    if not arg:
+        print(f"\n{NEON_Y}Usage: /fetchforget <url>{R}\n"); return
+    from tinydb import Query
+    url = arg.strip()
+    if not url.startswith("http"):
+        url = "https://" + url
+    db  = _wa_db()
+    W   = Query()
+    removed = db.remove(W.url == url)
+    if removed:
+        print(f"\n  {NEON_G}✓ Removed: {url}{R}\n")
+    else:
+        print(f"\n  {NEON_Y}Not found: {url}{R}\n")
+
+
+def wa_auto_inject(user_input: str, cfg: dict, messages: list, session_msgs: list) -> str:
+    """
+    Called before every AI query. If the user's message mentions a saved URL
+    or its domain, silently fetch a fresh snapshot and prepend it as context.
+    Returns the (possibly enriched) prompt to pass to ask().
+    """
+    try:
+        db   = _wa_db()
+        rows = db.all()
+    except Exception:
+        return user_input
+
+    import re as _re
+    for r in rows:
+        url    = r.get("url", "")
+        domain = r.get("domain", "")
+        if url in user_input or (domain and domain in user_input):
+            auth   = r.get("auth")
+            status, content = _wa_fetch(url, auth)
+            if status == 200 and content:
+                return (
+                    f"[WebAgent context — {url}]\n{content[:8000]}\n\n"
+                    f"---\nUser: {user_input}"
+                )
+            elif status in (401, 403):
+                return (
+                    f"[WebAgent: site {url} requires auth — run /fetchauth {url}]\n\n"
+                    f"User: {user_input}"
+                )
+    return user_input
+
+
+# ══════════════════════════════════════════════════════════════
 #  CORE ASK
 # ══════════════════════════════════════════════════════════════
 def ask(cfg: dict, messages: list, session_msgs: list,
@@ -3482,7 +3929,8 @@ def repl(cfg: dict, one_shot: str | None = None) -> None:
         if not user_input: continue
 
         if not user_input.startswith("/"):
-            last_response = ask(cfg, messages, session_msgs, user_input)
+            enriched = wa_auto_inject(user_input, cfg, messages, session_msgs)
+            last_response = ask(cfg, messages, session_msgs, enriched)
             continue
 
         parts = user_input.split(maxsplit=1)
@@ -3677,6 +4125,16 @@ def repl(cfg: dict, one_shot: str | None = None) -> None:
             cmd_clock(arg)
         elif cmd == "/gist":
             cmd_gist(arg)
+        elif cmd == "/image":
+            cmd_image(arg)
+        elif cmd == "/fetch":
+            last_response = cmd_web(arg, cfg, messages, session_msgs)
+        elif cmd == "/fetchauth":
+            cmd_webauth(arg)
+        elif cmd == "/fetchsites":
+            cmd_websites()
+        elif cmd == "/fetchforget":
+            cmd_webforget(arg)
         # ── developer tools ──────────────────────────────────
         elif cmd == "/debug":
             last_response = cmd_debug(arg, cfg, messages, session_msgs)
