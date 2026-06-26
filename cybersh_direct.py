@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# version: 1.5
+# version: 1.4
 """
  ██████╗██╗   ██╗██████╗ ███████╗██████╗     ███████╗██╗  ██╗
 ██╔════╝╚██╗ ██╔╝██╔══██╗██╔════╝██╔══██╗    ██╔════╝██║  ██║
@@ -3563,8 +3563,102 @@ def _wa_db():
     db_path = os.path.join(script_dir, "cybersh_webagent.json")
     return TinyDB(db_path)
 
-def _wa_fetch(url: str, auth: dict | None = None) -> tuple[int, str]:
-    """Fetch URL with optional auth. Returns (status_code, text)."""
+def _wa_clean_html(raw_text: str) -> str:
+    """Strip HTML tags and collapse whitespace into readable plain text."""
+    import re as _re
+    text = _re.sub(r"<script[^>]*>.*?</script>", "", raw_text, flags=_re.S)
+    text = _re.sub(r"<style[^>]*>.*?</style>",   "", text,     flags=_re.S)
+    text = _re.sub(r"<[^>]+>", " ", text)
+    text = _re.sub(r"[ \t]{2,}", " ", text)
+    text = "\n".join(l.strip() for l in text.splitlines() if l.strip())
+    return text[:12000]
+
+
+# Sites known to be JS-heavy SPAs that need a real browser
+_JS_HEAVY_DOMAINS = {
+    "x.com", "twitter.com", "instagram.com", "facebook.com",
+    "linkedin.com", "reddit.com", "tiktok.com", "pinterest.com",
+    "youtube.com", "discord.com", "twitch.tv", "github.com",
+}
+
+def _wa_is_spa(url: str) -> bool:
+    import re as _re
+    m = _re.match(r"https?://(?:www\.)?([^/]+)", url)
+    return bool(m and m.group(1) in _JS_HEAVY_DOMAINS)
+
+
+def _wa_fetch_playwright(url: str, auth: dict | None = None) -> tuple[int, str]:
+    """Render page with a real Chromium browser via Playwright, return plain text."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        _install_packages(["playwright"])
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            return 0, "playwright not installed — run: pip install playwright --break-system-packages && playwright install chromium"
+
+    # ensure chromium is installed
+    import subprocess as _sp
+    _sp.run(["playwright", "install", "chromium", "--quiet"], capture_output=True)
+
+    print(f"  {DIM}Launching Chromium browser…{R}")
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        ctx_opts = {}
+
+        # inject auth as cookies or headers
+        if auth:
+            atype = auth.get("type", "")
+            if atype == "cookie":
+                # parse "name=value; name2=value2" into list of dicts
+                import re as _re
+                cookies = []
+                import urllib.parse as _up
+                parsed = _up.urlparse(url)
+                domain  = parsed.netloc
+                for pair in auth["value"].split(";"):
+                    pair = pair.strip()
+                    if "=" in pair:
+                        n, v = pair.split("=", 1)
+                        cookies.append({"name": n.strip(), "value": v.strip(),
+                                        "domain": domain, "path": "/"})
+                ctx_opts["storage_state"] = {"cookies": cookies, "origins": []}
+
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            **ctx_opts
+        )
+
+        # bearer / basic — inject as extra HTTP headers
+        if auth:
+            atype = auth.get("type", "")
+            if atype == "bearer":
+                context.set_extra_http_headers({"Authorization": f"Bearer {auth['value']}"})
+            elif atype == "basic":
+                import base64 as _b64
+                creds = _b64.b64encode(f"{auth['user']}:{auth['pass']}".encode()).decode()
+                context.set_extra_http_headers({"Authorization": f"Basic {creds}"})
+
+        page = context.new_page()
+        try:
+            resp = page.goto(url, wait_until="networkidle", timeout=30000)
+            status = resp.status if resp else 200
+            # wait a little extra for dynamic content
+            page.wait_for_timeout(2000)
+            content = page.inner_text("body")
+            content = "\n".join(l.strip() for l in content.splitlines() if l.strip())
+            return status, content[:12000]
+        except Exception as e:
+            return 0, str(e)
+        finally:
+            browser.close()
+
+
+def _wa_fetch_urllib(url: str, auth: dict | None = None) -> tuple[int, str]:
+    """Fetch URL with urllib (fast, for regular static sites)."""
     import urllib.request as _ur, urllib.error as _ue, ssl as _ssl
     ctx = _ssl.create_default_context()
     headers = {"User-Agent": "Mozilla/5.0 (CyberSH WebAgent)"}
@@ -3581,24 +3675,30 @@ def _wa_fetch(url: str, auth: dict | None = None) -> tuple[int, str]:
     req = _ur.Request(url, headers=headers)
     try:
         with _ur.urlopen(req, timeout=15, context=ctx) as r:
-            ct = r.headers.get_content_type() or ""
-            raw = r.read()
-            if "html" in ct:
-                # strip tags for readability
-                import re as _re
-                text = raw.decode("utf-8", errors="replace")
-                text = _re.sub(r"<script[^>]*>.*?</script>", "", text, flags=_re.S)
-                text = _re.sub(r"<style[^>]*>.*?</style>",  "", text, flags=_re.S)
-                text = _re.sub(r"<[^>]+>", " ", text)
-                text = _re.sub(r"[ \t]{2,}", " ", text)
-                text = "\n".join(l.strip() for l in text.splitlines() if l.strip())
-                return 200, text[:12000]
-            else:
-                return 200, raw.decode("utf-8", errors="replace")[:12000]
+            ct  = r.headers.get_content_type() or ""
+            raw = r.read().decode("utf-8", errors="replace")
+            return 200, _wa_clean_html(raw) if "html" in ct else raw[:12000]
     except _ue.HTTPError as e:
         return e.code, str(e)
     except Exception as e:
         return 0, str(e)
+
+
+def _wa_fetch(url: str, auth: dict | None = None) -> tuple[int, str]:
+    """
+    Smart fetch: uses Playwright (real Chromium) for JS-heavy SPAs like X/Twitter,
+    Instagram, Reddit etc. Falls back to fast urllib for everything else.
+    Auth (cookie/bearer/basic) is forwarded to whichever engine is used.
+    """
+    if _wa_is_spa(url):
+        print(f"  {DIM}JS-heavy site detected — using Chromium renderer…{R}")
+        return _wa_fetch_playwright(url, auth)
+    status, content = _wa_fetch_urllib(url, auth)
+    # if urllib got back almost nothing (JS shell), retry with Playwright
+    if status == 200 and len(content.strip()) < 600:
+        print(f"  {DIM}Response too small ({len(content.strip())} chars) — retrying with Chromium…{R}")
+        return _wa_fetch_playwright(url, auth)
+    return status, content
 
 def _wa_find(url: str):
     """Return TinyDB record matching url or its domain, or None."""
