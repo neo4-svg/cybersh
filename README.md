@@ -12,13 +12,64 @@
 **CYBER SH — Your Personal Offline AI Assistant**  
 Runs entirely on your own computer. No cloud. No subscriptions. No one watching.
 
-![Version](https://img.shields.io/badge/version-1.5-brightgreen)
+![Version](https://img.shields.io/badge/version-1.6-brightgreen)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-orange)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows%20WSL-lightgrey)
 ![Security](https://img.shields.io/badge/security-audited%20v1.4-blue)
 
 </div>
+
+---
+
+## 🆕 v1.6 — New Features
+
+### `/agent` — Real tool-calling loop
+
+Agent mode no longer stops after one round. Read-only tool results (`search_files`, `read_file`, `web_search`, `rag_search`) are fed straight back to the model automatically, so it can act on what it just learned without you repeating yourself. Destructive actions (`run_command`, `create_file`, `edit_file`, `delete_file`, `open_app`, `make_dir`) still stop and ask for your `y/N` approval every time. Capped at 6 automatic round-trips per turn (`max_agent_iters` in config) so it can't run away.
+
+### `/see` — Local vision
+
+Analyze images entirely offline with a small multimodal model.
+
+```
+/see setup                        # download + configure a vision model (one time)
+/see screenshot.png what's wrong here?
+/see recon/target_page.png describe every UI element
+```
+
+Two model choices: LLaVA-Phi-3-mini (2.9GB, fast) or LLaVA 1.5 7B (8.5GB, higher quality). No cloud, no API key.
+
+### `/rag` — Local knowledge base
+
+Index your own files and get grounded answers instead of the model guessing.
+
+```
+/rag index ~/projects/cybersh     # chunk + embed a file or folder
+/rag ask how does the auto-updater verify checksums?
+/rag list                         # see what's indexed
+/rag clear                        # wipe the index
+```
+
+Uses your existing chat model in embedding mode — no extra download, no numpy/chromadb dependency, pure-Python cosine similarity.
+
+### `/plugins` — Drop-in extension system
+
+Add your own commands and agent tools without touching the core script.
+
+```
+/plugins new mycommand            # scaffold ~/.cybersh_plugins/mycommand.py
+/plugins reload                   # pick up changes without restarting
+/plugins                          # list what's loaded
+```
+
+Every `.py` file in `~/.cybersh_plugins/` (or `./cybersh_plugins/` next to wherever you run cybersh) is auto-loaded on startup. A plugin can register new `/slash` commands and new `ACTION:` tools the agent loop can call — see the generated template for the exact shape.
+
+### New developer tools
+
+`/testgen` (pytest generation) · `/docstring` (adds docstrings + type hints) · `/complexity` (Big-O analysis) · `/gitdiff` (AI reviews uncommitted changes) · `/commitmsg` (conventional commit messages from your diff) · `/todo` (scans for TODO/FIXME/HACK markers) · `/gitignore <stack>` · `/license <type>` · `/lint <file>` (wraps ruff/flake8/pylint/eslint/shellcheck if installed) · `/profile <script.py>` (cProfile + AI-explained hotspots).
+
+No new pip packages required for any of the above — vision/RAG/agent tools all run on `llama-cpp-python`, already in `requirements.txt`.
 
 ---
 
@@ -395,7 +446,68 @@ Once a site is saved, just mention it naturally — cybersh auto-fetches and inj
 /diff         → paste a git diff, AI explains the changes
 /rename <name> → 5 better name suggestions with reasons
 /challenge hard → coding or hacking challenge to practice
+/testgen      → paste code, get a pytest test suite
+/docstring    → paste code, get docstrings + type hints added
+/complexity   → Big-O time/space analysis of pasted code
+/gitdiff      → AI reviews your uncommitted changes before you commit
+/commitmsg    → conventional commit message generated from your diff
+/todo         → scans a file or folder for TODO/FIXME/HACK markers
+/gitignore python → instant .gitignore, offers to write the file
+/license mit  → generates + offers to write a LICENSE file
+/lint app.py  → runs ruff/flake8/pylint/eslint if installed, AI explains findings
+/profile script.py → cProfile a script, AI explains the hotspots
 ```
+
+---
+
+### 🤖 Agent mode — real tool-calling loop
+
+Agent mode (`/agent`) doesn't stop after one action anymore. When it runs a read-only tool — `search_files`, `read_file`, `web_search`, or `rag_search` — the result is fed straight back to it automatically, so it can decide what to do next on its own. Destructive actions (`run_command`, `create_file`, `edit_file`, `delete_file`, `open_app`, `make_dir`) always stop and ask for your approval first, every time.
+
+```
+you: find any python files with hardcoded API keys and show me the worst one
+agent: [searches files] → [reads matches] → [reports the worst offender]
+       (no destructive step needed, so it never had to ask — but it would have)
+```
+
+Capped at 6 automatic rounds per turn by default (`max_agent_iters` in `~/.cybersh_direct.json`).
+
+---
+
+### 👁 `/see` — local vision
+
+```
+/see setup                       → one-time download of a small multimodal model
+/see error_screenshot.png what's wrong here?
+/see diagram.png explain this architecture
+```
+
+Fully offline — runs a separate `llama-cpp-python` instance with a CLIP projector, no cloud.
+
+---
+
+### 📚 `/rag` — local knowledge base
+
+```
+/rag index ~/myproject           → chunk + embed every text file in a folder
+/rag ask what does the auth flow look like?
+/rag list                        → see what's indexed
+/rag clear                       → wipe it
+```
+
+Grounds answers in your own files instead of the model guessing. No extra dependencies — reuses your existing model for embeddings, pure-Python cosine similarity for search.
+
+---
+
+### 🔌 `/plugins` — extend it yourself
+
+```
+/plugins new mytool               → scaffolds ~/.cybersh_plugins/mytool.py
+/plugins reload                   → picks up changes, no restart needed
+/plugins                          → lists what's loaded
+```
+
+Any `.py` file dropped in `~/.cybersh_plugins/` is auto-loaded on startup. Plugins can register both new `/slash` commands and new `ACTION:` tools that the agent loop can call — open the scaffolded file for the exact API.
 
 ---
 
@@ -450,6 +562,7 @@ Once a site is saved, just mention it naturally — cybersh auto-fetches and inj
 
 | Version | What was added |
 |---------|---------------|
+| **v1.6** | **Real agent tool-calling loop** — read-only tool results auto-feed back to the model (max 6 rounds/turn) · **`/see`** — offline vision (LLaVA-Phi-3-mini or LLaVA 1.5 7B) · **`/rag`** — local file indexing + grounded retrieval, no extra deps · **`/plugins`** — drop-in `.py` extension system for new commands + agent tools · new dev tools: `/testgen` `/docstring` `/complexity` `/gitdiff` `/commitmsg` `/todo` `/gitignore` `/license` `/lint` `/profile` |
 | **v1.5** | **`/image`** — local Stable Diffusion image generation, saves `.png` next to script, auto GPU/CPU, supports `--steps`, `--size`, `--model`, `--neg` · **`/fetch`** — persistent web agent with TinyDB storage, auto-injects saved site content into AI context · **`/fetchauth`** — cookie / bearer / basic auth for saved sites · **`/fetchsites`** / **`/fetchforget`** — manage saved sites |
 | **v1.4** | **Security release** — TLS certificate verification restored · auto-updater SHA-256 checksum verification against published manifest · atomic update writes (crash-safe) · memory plain-text storage warning · obfuscated `chr()` code removed · downloaded model SHA-256 verification |
 | **v1.3** | OS-aware AI responses · loop/repetition auto-detection · entropy-based password checks · clipboard auto-detection (Wayland/X11/macOS/WSL) · rewritten `/headers` with severity tags · sessions system · `/convert` `/qr` `/speedtest` `/pwcheck` `/debug` `/review` `/template` `/gitlog` `/hash` `/osint` `/wordlist` `/think` `/debate` `/improve` `/eli5` `/ipinfo` `/base` `/clock` `/lorem` `/gist` |
@@ -521,6 +634,9 @@ CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --force-reinstall --bre
 | Your saved sessions | `~/.cybersh_sessions/` | ✅ Never touched |
 | Your notes | `~/.cybersh_notes.json` | ✅ Never touched |
 | Your goals | `~/.cybersh_goals.json` | ✅ Never touched |
+| Your RAG index | `~/.cybersh_rag/` | ✅ Never touched |
+| Your plugins | `~/.cybersh_plugins/` | ✅ Never touched |
+| Vision model files | `~/ollama-models/` | ✅ Never touched |
 
 ---
 
