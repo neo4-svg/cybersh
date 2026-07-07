@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# version: 1.5
+# version: 1.6
 """
  ██████╗██╗   ██╗██████╗ ███████╗██████╗     ███████╗██╗  ██╗
 ██╔════╝╚██╗ ██╔╝██╔══██╗██╔════╝██╔══██╗    ██╔════╝██║  ██║
@@ -11,6 +11,20 @@
 """
 
 import sys, os, json, time, shutil, re, subprocess, threading, datetime, textwrap, argparse, glob, readline
+import importlib.util
+
+def _own_version() -> str:
+    """Read the '# version:' header of this file so the banner never drifts out of sync."""
+    try:
+        with open(__file__) as f:
+            for line in f:
+                if line.strip().startswith("# version:"):
+                    return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return "?"
+
+APP_VERSION = _own_version()
 
 # ══════════════════════════════════════════════════════════════
 #  AUTO-UPDATER
@@ -332,6 +346,10 @@ ALL_COMMANDS = [
     "/uuid","/cheatsheet","/json","/base","/color","/slugify","/lorem",
     "/countdown","/ip","/clock","/gist","/cron","/quiz","/name","/image",
     "/fetch","/fetchauth","/fetchsites","/fetchforget",
+    "/see","/rag",
+    "/testgen","/docstring","/complexity","/gitdiff","/commitmsg",
+    "/todo","/gitignore","/license","/lint","/profile",
+    "/plugins",
     "--update","--no-update",
 ]
 
@@ -363,9 +381,8 @@ class RichInput:
         return options[state] if state < len(options) else None
 
     def read(self, prompt: str, multiline_hint: bool = True) -> str:
-        """Read input with rich prompt. Shift+Enter hint shown. Returns stripped text."""
+        """Read input with rich prompt. Returns stripped text."""
         try:
-            # show char count hint for long inputs
             text = input(prompt)
             return text.strip()
         except (EOFError, KeyboardInterrupt):
@@ -614,14 +631,18 @@ def cmd_diff_explain(arg: str, cfg: dict, messages: list, session_msgs: list) ->
 # ══════════════════════════════════════════════════════════════
 CONFIG_PATH = os.path.expanduser("~/.cybersh_direct.json")
 DEFAULT_CFG = {
-    "model_path":   "",
-    "context":      4096,
-    "temperature":  0.7,
-    "max_tokens":   2048,
-    "mode":         "chat",
-    "history_file": os.path.expanduser("~/.cybersh_direct_history.json"),
-    "max_history":  60,
-    "threads":      4,
+    "model_path":     "",
+    "context":        4096,
+    "temperature":    0.7,
+    "max_tokens":     2048,
+    "mode":           "chat",
+    "history_file":   os.path.expanduser("~/.cybersh_direct_history.json"),
+    "max_history":    60,
+    "threads":        4,
+    "max_agent_iters": 6,      # auto tool round-trips per turn
+    "vision_model_path": "",   # multimodal .gguf (e.g. moondream2)
+    "vision_mmproj_path": "",  # matching --mmproj clip projector file
+    "rag_enabled":    True,    # allow /rag commands to build a local index
 }
 
 # well-known GGUF download links (free, official)
@@ -706,6 +727,166 @@ def _verify_model_sha256(path: str, expected, label: str) -> bool:
         return True
 
 
+# Known multimodal (vision) GGUF model + mmproj (clip projector) pairs.
+# Both files are required — the mmproj is what actually encodes the image.
+KNOWN_VISION_MODELS = {
+    "1": {
+        "name":        "LLaVA-Phi-3-mini (2.9GB total) — small & fast, recommended",
+        "file":        "llava-phi-3-mini-int4.gguf",
+        "mmproj_file": "llava-phi-3-mini-mmproj-f16.gguf",
+        "url":         "https://huggingface.co/xtuner/llava-phi-3-mini-gguf/resolve/main/llava-phi-3-mini-int4.gguf",
+        "mmproj_url":  "https://huggingface.co/xtuner/llava-phi-3-mini-gguf/resolve/main/llava-phi-3-mini-mmproj-f16.gguf",
+        "handler":     "llava-1-5",
+    },
+    "2": {
+        "name":        "LLaVA 1.5 7B (8.5GB total) — higher quality, slower",
+        "file":        "ggml-model-q4_k.gguf",
+        "mmproj_file": "mmproj-model-f16.gguf",
+        "url":         "https://huggingface.co/mys/ggml_llava-v1.5-7b/resolve/main/ggml-model-q4_k.gguf",
+        "mmproj_url":  "https://huggingface.co/mys/ggml_llava-v1.5-7b/resolve/main/mmproj-model-f16.gguf",
+        "handler":     "llava-1-5",
+    },
+}
+
+def vision_setup_wizard(cfg: dict) -> None:
+    """Download and configure a vision (image-understanding) model."""
+    print(f"\n{BOLD_C}{'─'*60}")
+    print(f"  VISION SETUP — pick a multimodal model")
+    print(f"{'─'*60}{R}\n")
+    print(f"{NEON_Y}Already have a model + mmproj pair? [y/N]: {R}", end="")
+    has = input().strip().lower()
+
+    if has == "y":
+        print(f"{NEON_C}Path to vision .gguf model: {R}", end="")
+        mp = os.path.expanduser(input().strip())
+        print(f"{NEON_C}Path to matching mmproj (clip) .gguf: {R}", end="")
+        cp = os.path.expanduser(input().strip())
+        if os.path.exists(mp) and os.path.exists(cp):
+            cfg["vision_model_path"]  = mp
+            cfg["vision_mmproj_path"] = cp
+            save_cfg(cfg)
+            print(f"{NEON_G}✓ Vision model configured.{R}\n")
+        else:
+            print(f"{NEON_R}✗ One or both files not found.{R}\n")
+        return
+
+    print(f"\n{NEON_Y}Available vision models:{R}\n")
+    for k, m in KNOWN_VISION_MODELS.items():
+        print(f"  {NEON_C}[{k}]{R} {m['name']}")
+    print(f"\n{NEON_Y}Choose [1-{len(KNOWN_VISION_MODELS)}] or Enter to cancel: {R}", end="")
+    choice = input().strip()
+    if choice not in KNOWN_VISION_MODELS:
+        print(f"{DIM}Cancelled.{R}\n"); return
+
+    model  = KNOWN_VISION_MODELS[choice]
+    dl_dir = os.path.expanduser("~/ollama-models")
+    os.makedirs(dl_dir, exist_ok=True)
+    dest_m = os.path.join(dl_dir, model["file"])
+    dest_c = os.path.join(dl_dir, model["mmproj_file"])
+
+    print(f"\n{NEON_C}Downloading model…{R}")
+    ret1 = os.system(f'wget -c -O "{dest_m}" "{model["url"]}"')
+    print(f"\n{NEON_C}Downloading mmproj (clip projector)…{R}")
+    ret2 = os.system(f'wget -c -O "{dest_c}" "{model["mmproj_url"]}"')
+
+    if ret1 == 0 and ret2 == 0 and os.path.exists(dest_m) and os.path.exists(dest_c):
+        cfg["vision_model_path"]  = dest_m
+        cfg["vision_mmproj_path"] = dest_c
+        save_cfg(cfg)
+        print(f"\n{NEON_G}✓ Vision model ready! Try: /see <image_path> what's in this?{R}\n")
+    else:
+        print(f"{NEON_R}✗ Download failed. Try manually with wget, then run /see setup "
+              f"and point to the local files.{R}\n")
+
+
+_vision_llm_instance = None
+
+def get_vision_llm(cfg: dict):
+    """Lazily load a separate llama-cpp instance with a multimodal chat handler."""
+    global _vision_llm_instance
+    if _vision_llm_instance is not None:
+        return _vision_llm_instance
+
+    mp = cfg.get("vision_model_path", "").strip()
+    cp = cfg.get("vision_mmproj_path", "").strip()
+    if not mp or not cp or not os.path.exists(mp) or not os.path.exists(cp):
+        raise RuntimeError("No vision model configured — run: /see setup")
+
+    from llama_cpp import Llama
+    from llama_cpp.llama_chat_format import Llava15ChatHandler
+
+    print(f"{DIM}  Loading vision model (first use only)…{R}")
+    handler = Llava15ChatHandler(clip_model_path=cp, verbose=False)
+    n_gpu_layers = -1 if _detect_gpu()["type"] == "nvidia" else 0
+    _vision_llm_instance = Llama(
+        model_path   = mp,
+        chat_handler = handler,
+        n_ctx        = 4096,
+        n_threads    = cfg.get("threads", 4),
+        n_gpu_layers = n_gpu_layers,
+        logits_all   = True,   # required by some llava chat handlers
+        verbose      = False,
+    )
+    return _vision_llm_instance
+
+def cmd_vision(arg: str, cfg: dict) -> None:
+    """/see <image_path> [question] — analyze an image with a local vision model."""
+    if not arg:
+        print(f"{NEON_Y}Usage: /see <image_path> [question]{R}")
+        print(f"{DIM}       /see setup   — download/configure a vision model{R}\n")
+        return
+
+    if arg.strip().lower() == "setup":
+        vision_setup_wizard(cfg)
+        return
+
+    parts    = arg.split(maxsplit=1)
+    img_path = os.path.expanduser(parts[0])
+    question = parts[1] if len(parts) > 1 else "Describe this image in detail."
+
+    if not os.path.exists(img_path):
+        print(f"{NEON_R}✗ Image not found: {img_path}{R}\n")
+        return
+
+    try:
+        llm = get_vision_llm(cfg)
+    except Exception as e:
+        print(f"{NEON_R}✗ {e}{R}\n")
+        return
+
+    import base64, mimetypes
+    mime = mimetypes.guess_type(img_path)[0] or "image/jpeg"
+    with open(img_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+    data_uri = f"data:{mime};base64,{b64}"
+
+    bw = min(cols(), 62)
+    print(f"\n{NEON_P}{'▓'*bw}{R}")
+    print(f"{NEON_P}{BOLD}  👁  VISION{R}")
+    print(f"{NEON_P}{'▓'*bw}{R}\n")
+
+    start = time.time()
+    try:
+        resp = llm.create_chat_completion(
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": data_uri}},
+                    {"type": "text", "text": question},
+                ],
+            }],
+            max_tokens=1024,
+        )
+        answer = resp["choices"][0]["message"]["content"]
+        print(answer)
+    except Exception as e:
+        print(f"{NEON_R}✗ Vision inference failed: {e}{R}\n")
+        return
+
+    elapsed = time.time() - start
+    print(f"\n\n{DIM}  ⏱ {elapsed:.1f}s{R}\n")
+
+
 def load_cfg() -> dict:
     cfg = DEFAULT_CFG.copy()
     if os.path.exists(CONFIG_PATH):
@@ -742,6 +923,155 @@ def web_search(query: str, max_results: int = 5) -> str:
         return "\n\n".join(results)
     except Exception as e:
         return f"Search error: {e}"
+
+# ══════════════════════════════════════════════════════════════
+#  LOCAL RAG — offline retrieval over your own files, no cloud
+# ══════════════════════════════════════════════════════════════
+RAG_DIR        = os.path.expanduser("~/.cybersh_rag")
+RAG_INDEX_PATH = os.path.join(RAG_DIR, "index.json")
+RAG_CHUNK_SIZE = 900
+RAG_OVERLAP    = 150
+RAG_TEXT_EXTS  = {".txt",".md",".py",".js",".ts",".json",".yaml",".yml",".log",
+                  ".c",".cpp",".h",".java",".go",".rs",".sh",".conf",".cfg",".ini",".csv"}
+
+_embed_instance = None  # separate Llama instance, lazily loaded with embedding=True
+
+def _ensure_rag_dir() -> None:
+    os.makedirs(RAG_DIR, exist_ok=True)
+
+def get_embedder(cfg: dict):
+    """Lazily load a second llama-cpp instance (same model) in embedding mode.
+    Kept separate from the chat instance since llama-cpp-python needs
+    embedding=True at construction time to use .embed()."""
+    global _embed_instance
+    if _embed_instance is not None:
+        return _embed_instance
+    from llama_cpp import Llama
+    model_path = cfg.get("model_path","").strip()
+    if not model_path or not os.path.exists(model_path):
+        raise RuntimeError("No model loaded — run --setup first.")
+    print(f"{DIM}  Loading embedding model (first RAG use only)…{R}")
+    _embed_instance = Llama(
+        model_path = model_path,
+        n_ctx      = 2048,
+        n_threads  = cfg.get("threads", 4),
+        embedding  = True,
+        verbose    = False,
+    )
+    return _embed_instance
+
+def embed_text(text: str, cfg: dict) -> list:
+    """Return a single flat embedding vector for a piece of text."""
+    llm = get_embedder(cfg)
+    out = llm.embed(text)
+    # llama-cpp-python may return a single vector or a list-of-token-vectors —
+    # normalize to one mean-pooled vector either way.
+    if out and isinstance(out[0], (list, tuple)):
+        dim = len(out[0])
+        pooled = [0.0] * dim
+        for vec in out:
+            for i, v in enumerate(vec):
+                pooled[i] += v
+        n = len(out)
+        return [v / n for v in pooled]
+    return list(out)
+
+def _cosine(a: list, b: list) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x*y for x, y in zip(a, b))
+    na  = sum(x*x for x in a) ** 0.5
+    nb  = sum(y*y for y in b) ** 0.5
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
+
+def chunk_text(text: str, size: int = RAG_CHUNK_SIZE, overlap: int = RAG_OVERLAP) -> list:
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return []
+    chunks, i = [], 0
+    while i < len(text):
+        chunks.append(text[i:i+size])
+        i += max(1, size - overlap)
+    return chunks
+
+def rag_load_index() -> list:
+    if not os.path.exists(RAG_INDEX_PATH):
+        return []
+    try:
+        with open(RAG_INDEX_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def rag_save_index(index: list) -> None:
+    _ensure_rag_dir()
+    with open(RAG_INDEX_PATH, "w") as f:
+        json.dump(index, f)
+
+def rag_index_path(path: str, cfg: dict) -> str:
+    """Index a file or directory into the local RAG store. Returns a status string."""
+    path = os.path.expanduser(path)
+    if not os.path.exists(path):
+        return f"✗ Not found: {path}"
+
+    files = []
+    if os.path.isdir(path):
+        for root, _, fnames in os.walk(path):
+            if "/.git" in root or "/node_modules" in root:
+                continue
+            for fn in fnames:
+                if os.path.splitext(fn)[1].lower() in RAG_TEXT_EXTS:
+                    files.append(os.path.join(root, fn))
+    else:
+        files = [path]
+
+    if not files:
+        return f"✗ No indexable text files found under {path}"
+
+    index      = rag_load_index()
+    seen_hashes = {e["hash"] for e in index}
+    added, skipped = 0, 0
+    import hashlib as _hl
+
+    for fp in files[:500]:
+        try:
+            if os.path.getsize(fp) > 5_000_000:  # skip anything absurdly large
+                skipped += 1; continue
+            with open(fp, "r", errors="ignore") as f:
+                content = f.read()
+        except Exception:
+            skipped += 1; continue
+
+        for chunk in chunk_text(content):
+            h = _hl.sha256((fp + chunk).encode()).hexdigest()
+            if h in seen_hashes:
+                continue
+            try:
+                vec = embed_text(chunk, cfg)
+            except Exception as e:
+                return f"✗ Embedding failed: {e}"
+            index.append({"hash": h, "source": fp, "text": chunk, "embedding": vec})
+            seen_hashes.add(h)
+            added += 1
+
+    rag_save_index(index)
+    return f"✓ Indexed {added} new chunk(s) from {len(files)} file(s) ({skipped} skipped)."
+
+def rag_search(query: str, cfg: dict, top_k: int = 4) -> list:
+    """Return the top_k most relevant chunks for a query."""
+    index = rag_load_index()
+    if not index:
+        return []
+    try:
+        qvec = embed_text(query, cfg)
+    except Exception:
+        return []
+    scored = [(_cosine(qvec, e["embedding"]), e) for e in index]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [{"source": e["source"], "text": e["text"], "score": s}
+            for s, e in scored[:top_k] if s > 0]
 
 # ══════════════════════════════════════════════════════════════
 #  MODES
@@ -827,7 +1157,7 @@ MODES = {
         "icon": "🤖", "label": "AGENT", "color": NEON_O,
         "system": (
             "You are CYBER SH AGENT controlling a Linux computer. "
-            "When asked to do things on the computer, use ACTION BLOCKS:\n"
+            "When asked to do things, use ACTION BLOCKS — one per line:\n"
             "ACTION: run_command | <bash command>\n"
             "ACTION: create_file | <filepath> | <content>\n"
             "ACTION: edit_file | <filepath> | <old text> | <new text>\n"
@@ -836,7 +1166,15 @@ MODES = {
             "ACTION: search_files | <pattern>\n"
             "ACTION: read_file | <filepath>\n"
             "ACTION: make_dir | <path>\n"
-            "Always explain what you're doing before each ACTION. User confirms each one."
+            "ACTION: web_search | <query>\n"
+            "ACTION: rag_search | <query>   (searches the user's indexed local knowledge base)\n"
+            "Always explain what you're doing before each ACTION. "
+            "Destructive/side-effecting actions (run_command, create_file, edit_file, delete_file, "
+            "open_app, make_dir) require the user's approval each time. Read-only actions "
+            "(search_files, read_file, web_search, rag_search) run immediately and their output "
+            "is fed straight back to you automatically — you do NOT need the user to repeat "
+            "themselves. Use that output to decide your next ACTION or give a final answer. "
+            "Once you have enough information, stop issuing ACTIONs and give a normal final answer."
         ) + _GLOBAL_RULES,
     },
 }
@@ -1077,13 +1415,36 @@ def stream_local(cfg: dict, messages: list):
                     return
 
 # ══════════════════════════════════════════════════════════════
-#  AGENT ENGINE
+#  AGENT ENGINE — real tool-calling loop
 # ══════════════════════════════════════════════════════════════
-ACTION_RE = re.compile(
-    r"ACTION:\s*(run_command|create_file|edit_file|delete_file|"
-    r"open_app|search_files|read_file|make_dir)\s*\|(.+?)(?=ACTION:|$)",
-    re.DOTALL | re.IGNORECASE
-)
+# TOOLS registry: single source of truth for what the agent can call.
+# "confirm": True  -> user must approve (destructive / side-effecting)
+# "confirm": False -> read-only, runs immediately and result is fed straight back
+TOOLS = {
+    "run_command":  {"confirm": True,  "danger": True,  "desc": "Run a shell command"},
+    "create_file":  {"confirm": True,  "danger": False, "desc": "Create/overwrite a file"},
+    "edit_file":    {"confirm": True,  "danger": False, "desc": "Find/replace text in a file"},
+    "delete_file":  {"confirm": True,  "danger": True,  "desc": "Delete a file"},
+    "open_app":     {"confirm": True,  "danger": False, "desc": "Launch an application"},
+    "search_files": {"confirm": False, "danger": False, "desc": "Glob-search for files"},
+    "read_file":    {"confirm": False, "danger": False, "desc": "Read a file's contents"},
+    "make_dir":     {"confirm": True,  "danger": False, "desc": "Create a directory"},
+    "web_search":   {"confirm": False, "danger": False, "desc": "Search the web"},
+    "rag_search":   {"confirm": False, "danger": False, "desc": "Search your local knowledge base (/rag)"},
+}
+
+ACTION_RE = None  # built by _rebuild_action_re(), called at startup and after plugin loading
+
+def _rebuild_action_re() -> None:
+    global ACTION_RE
+    ACTION_RE = re.compile(
+        r"ACTION:\s*(" + "|".join(re.escape(k) for k in TOOLS) + r")\s*\|(.+?)(?=ACTION:|$)",
+        re.DOTALL | re.IGNORECASE
+    )
+
+_rebuild_action_re()
+
+MAX_AGENT_ITERS = 6  # hard cap on automatic tool-result round-trips per user turn
 
 def parse_actions(text: str) -> list:
     actions = []
@@ -1095,6 +1456,9 @@ def parse_actions(text: str) -> list:
     return actions
 
 def confirm_action(atype: str, parts: list) -> bool:
+    if not TOOLS.get(atype, {}).get("confirm", True):
+        return True  # read-only tools run without a prompt
+
     c = min(shutil.get_terminal_size((80,24)).columns, 60)
     print(f"\n{NEON_O}{'─'*c}")
     print(f"  🤖 AGENT ACTION")
@@ -1105,8 +1469,6 @@ def confirm_action(atype: str, parts: list) -> bool:
         "edit_file":    (NEON_C, "EDIT",   parts[0]),
         "delete_file":  (NEON_R, "DELETE", parts[0]),
         "open_app":     (NEON_P, "OPEN",   parts[0]),
-        "search_files": (NEON_C, "SEARCH", parts[0]),
-        "read_file":    (NEON_C, "READ",   parts[0]),
         "make_dir":     (NEON_G, "MKDIR",  parts[0]),
     }
     color, label, desc = labels.get(atype, (NEON_C, "ACTION", parts[0]))
@@ -1120,9 +1482,26 @@ def confirm_action(atype: str, parts: list) -> bool:
     except: ans = "n"
     return ans in ("y","yes")
 
-def execute_action(atype: str, parts: list) -> str:
+def execute_action(atype: str, parts: list, cfg: dict | None = None) -> str:
     try:
-        if atype == "run_command":
+        if atype in PLUGIN_TOOL_FUNCS:
+            try:
+                return str(PLUGIN_TOOL_FUNCS[atype](parts, cfg))
+            except Exception as e:
+                return f"✗ Plugin tool '{atype}' error: {e}"
+
+        if atype == "web_search":
+            return web_search(parts[0], max_results=5)
+
+        elif atype == "rag_search":
+            if cfg is None:
+                return "RAG unavailable right now."
+            hits = rag_search(parts[0], cfg, top_k=4)
+            if not hits:
+                return "No relevant local knowledge found. (Index files first with /rag index <path>)"
+            return "\n\n".join(f"[source: {h['source']}]\n{h['text']}" for h in hits)
+
+        elif atype == "run_command":
             r = subprocess.run(parts[0], shell=True, capture_output=True,
                                text=True, timeout=30, cwd=os.path.expanduser("~"))
             out = r.stdout.strip()
@@ -1170,14 +1549,14 @@ def execute_action(atype: str, parts: list) -> str:
         return f"✗ Error: {e}"
     return "done"
 
-def process_actions(text: str) -> str:
+def process_actions(text: str, cfg: dict | None = None) -> str:
     actions = parse_actions(text)
     if not actions: return ""
     results = []
     for a in actions:
         if confirm_action(a["type"], a["parts"]):
             print(f"  {NEON_G}⟳ Running…{R}")
-            out = execute_action(a["type"], a["parts"])
+            out = execute_action(a["type"], a["parts"], cfg)
             print(f"  {NEON_G}✓{R}")
             for line in out.split("\n")[:10]:
                 print(f"    {DIM}{line}{R}")
@@ -1187,6 +1566,177 @@ def process_actions(text: str) -> str:
             results.append(f"[{a['type']}] skipped")
         print()
     return "\n".join(results)
+
+# ══════════════════════════════════════════════════════════════
+#  PLUGIN ENGINE — drop-in .py extensions
+# ══════════════════════════════════════════════════════════════
+# Plugins are plain Python files placed in PLUGINS_DIR (or ./cybersh_plugins/
+# next to wherever you run cybersh from). Each one can define a setup(api)
+# function that registers new slash commands and/or new agent-callable tools.
+# See PLUGIN_TEMPLATE below for the exact shape — /plugins new <name> writes it out.
+PLUGINS_DIR = os.path.expanduser("~/.cybersh_plugins")
+
+PLUGIN_COMMANDS: dict   = {}   # "/name" -> {"handler": fn, "help": str, "category": str}
+PLUGIN_TOOL_FUNCS: dict = {}   # "tool_name" -> fn(parts, cfg) -> str
+LOADED_PLUGINS: list    = []   # [{"name","version","desc","file"}, ...]
+
+class PluginAPI:
+    """Passed to every plugin's setup(api). This is the whole plugin surface —
+    kept small and stable on purpose so plugins don't break across cybersh updates."""
+
+    def register_command(self, name: str, handler, help: str = "", category: str = "🔌 PLUGINS") -> None:
+        """Register a new /command.
+        handler(arg: str, ctx: dict) -> str | None
+        ctx = {"cfg": dict, "messages": list, "session_msgs": list, "ask": ask_fn}
+        Return a string to have it treated like an AI response (saved to history);
+        return None/"" if your command already printed everything itself."""
+        if not name.startswith("/"):
+            name = "/" + name
+        PLUGIN_COMMANDS[name] = {"handler": handler, "help": help, "category": category}
+        if name not in ALL_COMMANDS:
+            ALL_COMMANDS.append(name)
+
+    def register_tool(self, name: str, fn, confirm: bool = True,
+                       danger: bool = False, desc: str = "") -> None:
+        """Register a new agent-callable tool. The model can invoke it with
+        'ACTION: <name> | <arg>' and fn(parts: list, cfg: dict) -> str runs it.
+        confirm=True means the user is asked to approve each call (use this for
+        anything destructive/side-effecting); confirm=False runs immediately."""
+        TOOLS[name] = {"confirm": confirm, "danger": danger, "desc": desc or f"Plugin tool: {name}"}
+        PLUGIN_TOOL_FUNCS[name] = fn
+        _rebuild_action_re()
+
+    def log(self, msg: str) -> None:
+        print(f"{DIM}[plugin] {msg}{R}")
+
+
+def _ensure_plugin_dirs() -> None:
+    os.makedirs(PLUGINS_DIR, exist_ok=True)
+
+def _plugin_source_dirs() -> list:
+    dirs = [PLUGINS_DIR]
+    local = os.path.join(os.getcwd(), "cybersh_plugins")
+    if os.path.isdir(local) and local not in dirs:
+        dirs.append(local)
+    return dirs
+
+def load_plugins(cfg: dict, verbose: bool = True) -> None:
+    """Scan plugin directories and load every *.py file that defines setup(api)."""
+    global LOADED_PLUGINS
+    LOADED_PLUGINS = []
+    PLUGIN_COMMANDS.clear()
+    for name in list(PLUGIN_TOOL_FUNCS):     # drop only plugin-added tools, keep builtins
+        TOOLS.pop(name, None)
+    PLUGIN_TOOL_FUNCS.clear()
+
+    _ensure_plugin_dirs()
+    api = PluginAPI()
+
+    for d in _plugin_source_dirs():
+        if not os.path.isdir(d):
+            continue
+        for fn in sorted(os.listdir(d)):
+            if not fn.endswith(".py") or fn.startswith("_"):
+                continue
+            path     = os.path.join(d, fn)
+            mod_name = f"cybersh_plugin_{os.path.splitext(fn)[0]}"
+            try:
+                spec   = importlib.util.spec_from_file_location(mod_name, path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                if hasattr(module, "setup"):
+                    module.setup(api)
+                LOADED_PLUGINS.append({
+                    "name":    getattr(module, "PLUGIN_NAME", os.path.splitext(fn)[0]),
+                    "version": getattr(module, "PLUGIN_VERSION", "?"),
+                    "desc":    getattr(module, "PLUGIN_DESC", ""),
+                    "file":    path,
+                })
+                if verbose:
+                    print(f"{NEON_G}  ✓ plugin loaded: {LOADED_PLUGINS[-1]['name']}{R}")
+            except Exception as e:
+                if verbose:
+                    print(f"{NEON_R}  ✗ plugin {fn} failed: {e}{R}")
+
+    _rebuild_action_re()
+
+
+PLUGIN_TEMPLATE = '''"""
+CyberSH plugin — drop this file into ~/.cybersh_plugins/ and it loads automatically.
+"""
+
+PLUGIN_NAME    = "{name}"
+PLUGIN_VERSION = "1.0"
+PLUGIN_DESC    = "Describe what this plugin does."
+
+
+def my_command(arg: str, ctx: dict) -> str:
+    """/{name} <text> — example command."""
+    cfg, messages, session_msgs, ask = ctx["cfg"], ctx["messages"], ctx["session_msgs"], ctx["ask"]
+    if not arg:
+        print("Usage: /{name} <text>")
+        return ""
+    # Replace this with your own logic, or call ask(cfg, messages, session_msgs, "...")
+    # to route something through the AI.
+    print(f"You said: {{arg}}")
+    return ""
+
+
+def my_tool(parts: list, cfg: dict) -> str:
+    """Agent-callable tool — the AI triggers this with: ACTION: {name}_tool | <arg>"""
+    return f"{name}_tool ran with: {{parts[0] if parts else ''}}"
+
+
+def setup(api) -> None:
+    api.register_command("{name}", my_command,
+                          help="Example plugin command", category="🔌 PLUGINS")
+    api.register_tool("{name}_tool", my_tool, confirm=False,
+                       desc="Example agent-callable plugin tool")
+'''
+
+def cmd_plugins(action: str, arg: str, cfg: dict) -> None:
+    """/plugins [list|reload|dir|new <name>]"""
+    a = (action or "list").lower()
+    w = min(cols(), 62)
+
+    if a in ("list", ""):
+        print(f"\n{NEON_C}{'─'*w}")
+        print(f"{NEON_C}{BOLD}  🔌 Plugins — {len(LOADED_PLUGINS)} loaded{R}")
+        print(f"{NEON_C}{'─'*w}{R}")
+        if not LOADED_PLUGINS:
+            print(f"{DIM}  None yet. Drop a .py file in {PLUGINS_DIR}, "
+                  f"or run /plugins new <name> to scaffold one.{R}")
+        for p in LOADED_PLUGINS:
+            print(f"  {NEON_G}{p['name']}{R} {DIM}v{p['version']} — {p['desc']}{R}")
+            print(f"    {DIM}{p['file']}{R}")
+        if PLUGIN_COMMANDS:
+            print(f"\n  {NEON_Y}Commands:{R} {', '.join(sorted(PLUGIN_COMMANDS))}")
+        print(f"\n  {DIM}dir: {PLUGINS_DIR}{R}\n")
+
+    elif a == "reload":
+        print(f"\n{NEON_C}🔄 Reloading plugins…{R}\n")
+        load_plugins(cfg, verbose=True)
+        print()
+
+    elif a == "dir":
+        _ensure_plugin_dirs()
+        print(f"\n{NEON_C}Plugin directory: {PLUGINS_DIR}{R}\n")
+
+    elif a == "new":
+        if not arg:
+            print(f"{NEON_Y}Usage: /plugins new <name>{R}\n"); return
+        _ensure_plugin_dirs()
+        safe = re.sub(r"[^a-zA-Z0-9_]", "_", arg.strip())
+        dest = os.path.join(PLUGINS_DIR, f"{safe}.py")
+        if os.path.exists(dest):
+            print(f"{NEON_R}✗ {dest} already exists.{R}\n"); return
+        with open(dest, "w") as f:
+            f.write(PLUGIN_TEMPLATE.format(name=safe))
+        print(f"\n{NEON_G}✓ Created {dest}{R}")
+        print(f"{DIM}Edit it, then run /plugins reload (or just restart cybersh).{R}\n")
+
+    else:
+        print(f"{NEON_Y}Usage: /plugins [list|reload|dir|new <name>]{R}\n")
 
 # ══════════════════════════════════════════════════════════════
 #  SPINNER
@@ -1221,42 +1771,60 @@ class Spinner:
 def cols(): return shutil.get_terminal_size((80,24)).columns
 def div(color=DIM, ch="─"): return f"{color}{ch*cols()}{R}"
 
+_LOGO_LINES = (
+    r" ██████╗██╗   ██╗██████╗ ███████╗██████╗     ███████╗██╗  ██╗",
+    r"██╔════╝╚██╗ ██╔╝██╔══██╗██╔════╝██╔══██╗    ██╔════╝██║  ██║",
+    r"██║      ╚████╔╝ ██████╔╝█████╗  ██████╔╝    ███████╗███████║",
+    r"██║       ╚██╔╝  ██╔══██╗██╔══╝  ██╔══██╗    ╚════██║██╔══██║",
+    r"╚██████╗   ██║   ██████╔╝███████╗██║  ██║    ███████║██║  ██║",
+    r" ╚═════╝   ╚═╝   ╚═════╝ ╚══════╝╚═╝  ╚═╝    ╚══════╝╚═╝  ╚═╝",
+)
+
+def _print_logo() -> None:
+    print(f"\n{NEON_C}{BOLD}")
+    for line in _LOGO_LINES:
+        print(line)
+
+def _subsystem_status(cfg: dict) -> str:
+    """One compact line showing what's actually configured/loaded right now."""
+    bits = []
+    n_plugins = len(LOADED_PLUGINS)
+    bits.append(f"{NEON_G}🔌 {n_plugins}{R}" if n_plugins else f"{DIM}🔌 0{R}")
+
+    rag_n = len(rag_load_index()) if cfg.get("rag_enabled", True) else 0
+    bits.append(f"{NEON_G}📚 {rag_n}{R}" if rag_n else f"{DIM}📚 0{R}")
+
+    vision_on = bool(cfg.get("vision_model_path") and cfg.get("vision_mmproj_path"))
+    bits.append(f"{NEON_G}👁 on{R}" if vision_on else f"{DIM}👁 off{R}")
+
+    return "  ".join(bits)
+
 def print_banner(cfg: dict) -> None:
     mode = MODES.get(cfg.get("mode","chat"), MODES["chat"])
     mc   = mode["color"]
+    bw   = min(cols(), 66)
     now  = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     model_name = os.path.basename(cfg.get("model_path","no model")).replace(".gguf","")
-    print(f"\n{NEON_C}{BOLD}")
-    print(r" ██████╗██╗   ██╗██████╗ ███████╗██████╗     ███████╗██╗  ██╗")
-    print(r"██╔════╝╚██╗ ██╔╝██╔══██╗██╔════╝██╔══██╗    ██╔════╝██║  ██║")
-    print(r"██║      ╚████╔╝ ██████╔╝█████╗  ██████╔╝    ███████╗███████║")
-    print(r"██║       ╚██╔╝  ██╔══██╗██╔══╝  ██╔══██╗    ╚════██║██╔══██║")
-    print(r"╚██████╗   ██║   ██████╔╝███████╗██║  ██║    ███████║██║  ██║")
-    print(r" ╚═════╝   ╚═╝   ╚═════╝ ╚══════╝╚═╝  ╚═╝    ╚══════╝╚═╝  ╚═╝")
-    print(f"  DIRECT — No Server · Pure Python{R}\n")
-    print(div())
+
+    print(f"{DIM}{'─'*bw}{R}")
     print(f"  {NEON_C}MODEL{R} {BOLD}{model_name}{R}  "
           f"{NEON_C}MODE{R} {mc}{BOLD}{mode['icon']} {mode['label']}{R}  "
           f"{NEON_C}TEMP{R} {NEON_Y}{cfg['temperature']}{R}  {DIM}{now}{R}")
-    print(div())
+    print(f"  {NEON_C}v{APP_VERSION}{R}  {_subsystem_status(cfg)}")
+    print(f"{DIM}{'─'*bw}{R}")
     print(f"  {DIM}Modes:{R} {NEON_P}/vibe{R} {NEON_G}/sec{R} "
-          f"{NEON_Y}/code{R} {NEON_C}/chat{R} {NEON_O}/agent{R} {NEON_G}/shell{R}  "
+          f"{NEON_Y}/code{R} {NEON_C}/chat{R} {NEON_O}/agent{R}  "
           f"{DIM}Files:{R} {NEON_C}/f <path>  /o <path>{R}  "
           f"{DIM}Help:{R} {NEON_C}/help{R}")
-    print(div() + "\n")
+    print(f"{DIM}{'─'*bw}{R}\n")
 
 def startup_selector(cfg: dict) -> None:
-    """Show mode selector on startup."""
-    print(f"\n{NEON_C}{BOLD}")
-    print(r" ██████╗██╗   ██╗██████╗ ███████╗██████╗     ███████╗██╗  ██╗")
-    print(r"██╔════╝╚██╗ ██╔╝██╔══██╗██╔════╝██╔══██╗    ██╔════╝██║  ██║")
-    print(r"██║      ╚████╔╝ ██████╔╝█████╗  ██████╔╝    ███████╗███████║")
-    print(r"██║       ╚██╔╝  ██╔══██╗██╔══╝  ██╔══██╗    ╚════██║██╔══██║")
-    print(r"╚██████╗   ██║   ██████╔╝███████╗██║  ██║    ███████║██║  ██║")
-    print(r" ╚═════╝   ╚═╝   ╚═════╝ ╚══════╝╚═╝  ╚═╝    ╚══════╝╚═╝  ╚═╝")
+    """Show the logo once + mode selector on startup."""
+    bw = min(cols(), 66)
+    _print_logo()
     model_name = os.path.basename(cfg.get("model_path","no model")).replace(".gguf","")
-    print(f"  DIRECT  ·  {model_name}{R}\n")
-    print(div())
+    print(f"  DIRECT — No Server · Pure Python  ·  {model_name}{R}\n")
+    print(f"{DIM}{'─'*bw}{R}")
     print(f"\n  {BOLD}Select mode:{R}\n")
     menu = [
         ("1","agent",NEON_O,"🤖","Agent  — AI controls your computer"),
@@ -1268,7 +1836,7 @@ def startup_selector(cfg: dict) -> None:
     for num, key, color, icon, desc in menu:
         cur = f"  {DIM}← current{R}" if key == cfg.get("mode","chat") else ""
         print(f"  {color}{BOLD}[{num}]{R}  {icon}  {color}{desc}{R}{cur}")
-    print(f"\n{div()}")
+    print(f"\n{DIM}{'─'*bw}{R}")
     sys.stdout.write(f"\n  {NEON_Y}Choose [1-5] (Enter = keep current): {R}")
     sys.stdout.flush()
     try: choice = input().strip()
@@ -1276,17 +1844,15 @@ def startup_selector(cfg: dict) -> None:
     m = {"1":"agent","2":"sec","3":"vibe","4":"code","5":"chat"}
     if choice in m: cfg["mode"] = m[choice]
 
-def print_help() -> None:
-    print(f"\n{div(BOLD_C)}")
-    print(f"{BOLD_C}  CYBER SH DIRECT — COMMANDS{R}")
-    print(div(BOLD_C))
+def _help_sections() -> list:
+    """Built fresh each call so plugin-registered commands always show up."""
     sections = [
-        ("MODES", [
-            ("/agent","🤖 AI controls your computer"),
-            ("/sec",  "🔐 Bug bounty expert"),
-            ("/vibe", "🎨 Creative vibe coding"),
-            ("/code", "⚡ Production code"),
-            ("/chat", "💬 General chat"),
+        ("🕹️  MODES", [
+            ("/agent","AI controls your computer"),
+            ("/sec",  "Bug bounty expert"),
+            ("/vibe", "Creative vibe coding"),
+            ("/code", "Production code"),
+            ("/chat", "General chat"),
         ]),
         ("🧠 MEMORY", [
             ("/remember <anything>",  "AI remembers this (plain-text JSON, not encrypted)"),
@@ -1318,23 +1884,60 @@ def print_help() -> None:
             ("/ip [address]",            "IP geolocation lookup (yours or any IP)"),
             ("/clock [+offset]",         "World clock across timezones"),
             ("/gist <url|id>",           "Fetch + display a GitHub Gist"),
-            ("/image <prompt>",          "Generate image with Stable Diffusion → saves .png"),
-            ("/fetch <url> [task]",        "Fetch URL, save it, ask AI about it"),
-            ("/fetchauth <url>",           "Add/update auth (cookie/bearer/basic) for a site"),
-            ("/fetchsites",               "List all saved sites"),
-            ("/fetchforget <url>",         "Remove a saved site"),
+        ]),
+        ("🌐 WEB & MODELS", [
+            ("/web <query>",             "Search web, feed results to AI"),
+            ("/models",                  "Download a new model"),
+            ("/fetch <url> [task]",      "Fetch URL, save it, ask AI about it"),
+            ("/fetchauth <url>",         "Add/update auth (cookie/bearer/basic) for a site"),
+            ("/fetchsites",              "List all saved sites"),
+            ("/fetchforget <url>",       "Remove a saved site"),
+        ]),
+        ("🎨 GENERATIVE", [
+            ("/image <prompt>",             "Generate image with Stable Diffusion → saves .png"),
+            ("/see <image> [question]",     "Vision: analyze an image locally (/see setup to configure)"),
+            ("/rag index <path>",           "Index a file/folder into your local knowledge base"),
+            ("/rag ask <question>",         "Ask a question grounded in your indexed files"),
+            ("/rag list | /rag clear",      "View or wipe the local RAG index"),
         ]),
         ("👨‍💻 DEVELOPER", [
             ("/debug",                   "Paste broken code, AI finds every bug"),
             ("/review",                  "Full code review — bugs, security, performance"),
             ("/template flask api",      "Generate a production-ready project template"),
             ("/gitlog",                  "AI summarizes your recent git commits"),
+            ("/testgen",                 "Paste code, AI writes a pytest test suite"),
+            ("/docstring",               "Paste code, AI adds docstrings + type hints"),
+            ("/complexity",              "Big-O time/space analysis of pasted code"),
+            ("/gitdiff [staged]",        "AI reviews uncommitted changes before you commit"),
+            ("/commitmsg",               "Generate a conventional commit message from your diff"),
+            ("/todo [path]",             "Scan for TODO/FIXME/HACK markers, AI triages them"),
+            ("/gitignore <stack>",       "Generate + optionally write a .gitignore"),
+            ("/license <type> [holder]", "Generate + optionally write a LICENSE file"),
+            ("/lint <file>",             "Run a real linter if installed, AI explains findings"),
+            ("/profile <script.py>",     "cProfile a script, AI explains the hotspots"),
+            ("/explaincode",             "Paste code → AI explains every line"),
+            ("/roast",                   "AI roasts your bad code (with fixes)"),
+            ("/rename <name>",           "AI suggests better variable/function names"),
+            ("/regex <desc>",            "AI writes a regex for you"),
+            ("/git <task>",              "AI gives exact git commands"),
+            ("/diff",                    "Paste git diff → AI explains changes"),
+        ]),
+        ("🔌 PLUGINS", [
+            ("/plugins",                 "List loaded plugins and their commands"),
+            ("/plugins new <name>",      "Scaffold a new plugin in ~/.cybersh_plugins/"),
+            ("/plugins reload",          "Reload all plugins without restarting"),
+            ("/plugins dir",             "Show the plugin directory path"),
         ]),
         ("🔐 SECURITY", [
             ("/hash <hash>",             "Identify hash type + attempt crack"),
             ("/headers <url>",           "Check HTTP security headers of any site"),
             ("/osint <username>",        "Full OSINT checklist for a target"),
             ("/wordlist <theme>",        "Generate targeted password wordlist"),
+            ("/recon <target>",          "Bug bounty recon plan"),
+            ("/payload <type>",          "Payloads: xss|sqli|ssrf|lfi|rce"),
+            ("/explain <cmd>",           "Explain a command"),
+            ("/cvesearch <id>",          "Search & analyze CVE/vulnerability"),
+            ("/ctf <data>",              "CTF challenge analyzer"),
         ]),
         ("🤖 AI TOOLS", [
             ("/think <question>",        "AI thinks step by step before answering"),
@@ -1345,8 +1948,9 @@ def print_help() -> None:
             ("/cron <expr|english>",     "Explain a cron expr, or build one from English"),
             ("/quiz <topic>",            "5-question multiple-choice quiz"),
             ("/name <description>",      "Brainstorm names for a project/product"),
+            ("/challenge [level]",       "Get a coding/hacking challenge"),
         ]),
-        ("💾 SESSIONS", [
+        ("💾 SAVED SESSIONS", [
             ("/session save <name>",    "Save current chat with a name"),
             ("/session list",           "Show all saved sessions"),
             ("/session load <n>",       "Load session by number or name"),
@@ -1359,54 +1963,28 @@ def print_help() -> None:
             ("/goals done <n>",       "Mark goal as done"),
             ("/calc <expr>",          "Quick math: /calc 15% of 240"),
             ("/summarize <url>",      "Fetch + summarize any webpage"),
-            ("/timer 5m",             "Countdown timer"),
+            ("/timer 5m",             "Countdown timer (5m, 30s, 1h)"),
             ("/weather [city]",       "ASCII weather forecast"),
-            ("/translate <l> <t>",    "Translate to any language"),
+            ("/translate <l> <t>",    "Translate text to any language"),
             ("/recap",                "Summary of this session"),
+            ("/note <text>",          "Save a quick note"),
+            ("/notes list",           "Show all notes"),
+            ("/tip",                  "Show tip of the day"),
+            ("/syswatch",             "Live CPU/RAM/disk monitor"),
+            ("/benchmark",            "CPU + RAM + disk speed test with score"),
+            ("/passgen [type]",       "Generate passwords/phrases/API keys"),
+            ("/encode <text>",        "Base64/hex/URL/MD5/SHA256 encode"),
+            ("/tldr <cmd>",           "Explain any command in plain English"),
+            ("/howto <task>",         "Get exact command for any task"),
+            ("/fix <error>",          "Paste error, get instant fix"),
         ]),
-        ("FILES", [
+        ("📁 FILES", [
             ("/f <path>", "Load file into AI context"),
             ("/o <path>", "Save last response to file"),
             ("/run",      "Execute last code block"),
             ("/copy",     "Copy to clipboard"),
         ]),
-        ("SECURITY", [
-            ("/recon <target>",    "Bug bounty recon plan"),
-            ("/payload <type>",    "Payloads: xss|sqli|ssrf|lfi|rce"),
-            ("/explain <cmd>",     "Explain a command"),
-            ("/cvesearch <id>",    "Search & analyze CVE/vulnerability"),
-        ]),
-        ("WEB & MODELS", [
-            ("/web <query>",       "Search web, feed results to AI"),
-            ("/models",            "Download a new model"),
-        ]),
-        ("TOOLS", [
-            ("/tldr <cmd>",        "Explain any command in plain English"),
-            ("/howto <task>",      "Get exact command for any task"),
-            ("/fix <error>",       "Paste error, get instant fix"),
-            ("/passgen [type]",    "Generate passwords/phrases/API keys"),
-            ("/encode <text>",     "Base64/hex/URL/MD5/SHA256 encode"),
-            ("/syswatch",          "Live CPU/RAM/disk monitor"),
-            ("/benchmark",         "CPU + RAM + disk speed test with score"),
-            ("/note <text>",       "Save a quick note"),
-            ("/notes list",        "Show all notes"),
-            ("/tip",               "Show tip of the day"),
-            ("/weather [city]",    "ASCII weather forecast"),
-            ("/timer 5m",          "Countdown timer (5m, 30s, 1h)"),
-        ]),
-        ("CODE & AI LAB", [
-            ("/explaincode",       "Paste code → AI explains every line"),
-            ("/roast",             "AI roasts your bad code (with fixes)"),
-            ("/rename <name>",     "AI suggests better variable/function names"),
-            ("/regex <desc>",      "AI writes a regex for you"),
-            ("/git <task>",        "AI gives exact git commands"),
-            ("/diff",              "Paste git diff → AI explains changes"),
-            ("/translate <l> <t>", "Translate text to any language"),
-            ("/challenge [level]", "Get a coding/hacking challenge"),
-            ("/ctf <data>",        "CTF challenge analyzer"),
-            ("/recap",             "Summary of this session"),
-        ]),
-        ("SESSION", [
+        ("⚙️  SETTINGS", [
             ("/clear",   "Clear history"),
             ("/history", "Show history"),
             ("/temp <n>","Set temperature"),
@@ -1415,11 +1993,81 @@ def print_help() -> None:
             ("/exit",    "Exit"),
         ]),
     ]
+
+    # merge in plugin-registered commands, grouped by whatever category they asked for
+    if PLUGIN_COMMANDS:
+        by_cat: dict = {}
+        for name, meta in PLUGIN_COMMANDS.items():
+            by_cat.setdefault(meta.get("category") or "🔌 PLUGINS", []).append(
+                (name, meta.get("help") or "(no description)"))
+        for cat, entries in by_cat.items():
+            existing = next((s for s in sections if s[0] == cat), None)
+            if existing:
+                existing[1].extend(entries)
+            else:
+                sections.append((cat, entries))
+
+    return sections
+
+
+def print_help(query: str = "") -> None:
+    sections = _help_sections()
+    q = query.strip().lower()
+
+    w = min(cols(), 74)
+    total_cmds = sum(len(cmds) for _, cmds in sections)
+
+    # ── /help <category> or /help all ──────────────────────────
+    if q in ("all", "everything"):
+        print(f"\n{div(BOLD_C)}")
+        print(f"{BOLD_C}  CYBER SH DIRECT — ALL COMMANDS ({total_cmds}){R}")
+        print(div(BOLD_C))
+        for section, cmds in sections:
+            print(f"\n  {NEON_Y}{BOLD}{section}{R}")
+            for cmd, desc in cmds:
+                print(f"    {NEON_C}{cmd:<26}{R}{DIM}{desc}{R}")
+        print(f"\n{div()}\n")
+        return
+
+    if q:
+        cat_match = [s for s in sections if q in s[0].lower()]
+        if cat_match:
+            print(f"\n{div(BOLD_C)}")
+            for section, cmds in cat_match:
+                print(f"{BOLD_C}  {section}{R}")
+                print(div(BOLD_C))
+                for cmd, desc in cmds:
+                    print(f"    {NEON_C}{cmd:<26}{R}{DIM}{desc}{R}")
+                print()
+            return
+
+        # search command names + descriptions
+        needle = q.lstrip("/")
+        hits = [(section, cmd, desc) for section, cmds in sections for cmd, desc in cmds
+                if needle in cmd.lower().lstrip("/") or needle in desc.lower()]
+        print(f"\n{div(BOLD_C)}")
+        if hits:
+            print(f"{BOLD_C}  🔍 /help \"{query}\" — {len(hits)} match(es){R}")
+            print(div(BOLD_C))
+            for section, cmd, desc in hits:
+                print(f"    {NEON_C}{cmd:<26}{R}{DIM}{desc}{R}  {DIM}({section}){R}")
+        else:
+            print(f"{NEON_R}  No commands matched \"{query}\".{R}")
+            print(f"  {DIM}Try /help (no argument) for the full index, or /help all for everything.{R}")
+        print(f"\n{div()}\n")
+        return
+
+    # ── default: compact index, not a wall of text ─────────────
+    print(f"\n{div(BOLD_C)}")
+    print(f"{BOLD_C}  CYBER SH DIRECT — {total_cmds} COMMANDS ACROSS {len(sections)} CATEGORIES{R}")
+    print(div(BOLD_C))
     for section, cmds in sections:
-        print(f"\n  {NEON_Y}{BOLD}{section}{R}")
-        for cmd, desc in cmds:
-            print(f"    {NEON_C}{cmd:<22}{R}{DIM}{desc}{R}")
-    print(f"\n{div()}\n")
+        preview = ", ".join(c for c, _ in cmds[:3])
+        print(f"  {NEON_Y}{BOLD}{section:<20}{R}{DIM}({len(cmds)})  {preview}{'…' if len(cmds) > 3 else ''}{R}")
+    print(f"\n  {NEON_C}/help <category>{R}{DIM}  — e.g. /help developer, /help security{R}")
+    print(f"  {NEON_C}/help <word>{R}{DIM}     — search command names + descriptions{R}")
+    print(f"  {NEON_C}/help all{R}{DIM}        — dump everything at once{R}")
+    print(f"{div()}\n")
 
 # ══════════════════════════════════════════════════════════════
 #  HISTORY
@@ -1619,6 +2267,58 @@ def cmd_summarize_url(arg: str, cfg: dict, messages: list, session_msgs: list) -
     return ask(cfg, messages, session_msgs,
         f"Summarize this webpage content in bullet points. "
         f"Extract: main topic, key points, any important numbers or dates, and conclusion.\n\n{text}")
+
+# ══════════════════════════════════════════════════════════════
+#  RAG COMMAND ROUTER
+# ══════════════════════════════════════════════════════════════
+def cmd_rag(action: str, arg: str, cfg: dict, messages: list, session_msgs: list) -> str:
+    """Router for /rag subcommands: index, ask, list, clear."""
+    a = (action or "").lower()
+
+    if a in ("index", "add"):
+        if not arg:
+            print(f"{NEON_Y}Usage: /rag index <file-or-directory>{R}\n"); return ""
+        print(f"\n{NEON_C}📚 Indexing {arg}…{R}")
+        print(f"{DIM}(first run loads an embedding model — may take a moment){R}\n")
+        print(rag_index_path(arg, cfg) + "\n")
+        return ""
+
+    elif a in ("list", "status", ""):
+        index = rag_load_index()
+        srcs  = sorted({e["source"] for e in index})
+        w = min(cols(), 60)
+        print(f"\n{NEON_C}{'─'*w}")
+        print(f"  📚 Local RAG Index — {len(index)} chunk(s), {len(srcs)} file(s)")
+        print(f"{'─'*w}{R}")
+        for s in srcs[:30]:
+            print(f"  {DIM}{s}{R}")
+        if len(srcs) > 30:
+            print(f"  {DIM}… and {len(srcs)-30} more{R}")
+        print(f"\n{DIM}/rag index <path>  ·  /rag ask <question>  ·  /rag clear{R}\n")
+        return ""
+
+    elif a == "clear":
+        if os.path.exists(RAG_INDEX_PATH):
+            os.remove(RAG_INDEX_PATH)
+        print(f"\n{NEON_G}✓ RAG index cleared.{R}\n")
+        return ""
+
+    elif a == "ask":
+        if not arg:
+            print(f"{NEON_Y}Usage: /rag ask <question>{R}\n"); return ""
+        hits = rag_search(arg, cfg, top_k=5)
+        if not hits:
+            print(f"\n{NEON_Y}⚠ Nothing indexed yet (or no match). Run /rag index <path> first.{R}\n")
+            return ""
+        context = "\n\n".join(f"[{h['source']}]\n{h['text']}" for h in hits)
+        return ask(cfg, messages, session_msgs,
+            f"Using ONLY the local context below, answer the question. "
+            f"If the context doesn't contain the answer, say so plainly.\n\n"
+            f"--- LOCAL CONTEXT ---\n{context}\n--- END CONTEXT ---\n\nQuestion: {arg}")
+
+    else:
+        # treat the whole thing as a question if it doesn't match a subcommand
+        return cmd_rag("ask", (action + " " + arg).strip(), cfg, messages, session_msgs)
 
 # ══════════════════════════════════════════════════════════════
 #  QUICK MATH
@@ -2627,19 +3327,24 @@ def cmd_pwcheck(arg: str, cfg: dict, messages: list, session_msgs: list) -> str:
 #  DEVELOPER TOOLS
 # ══════════════════════════════════════════════════════════════
 
+def _read_pasted_code(arg: str, prompt: str = "Paste your code (type END on a new line when done):") -> str:
+    """Shared helper: use inline arg if given, else read multi-line paste until END."""
+    if arg:
+        return arg
+    print(f"{NEON_Y}{prompt}{R}")
+    lines = []
+    while True:
+        try:
+            line = input()
+            if line.strip() == "END": break
+            lines.append(line)
+        except EOFError: break
+    return "\n".join(lines)
+
+
 def cmd_debug(arg: str, cfg: dict, messages: list, session_msgs: list) -> str:
     """Paste broken code, AI finds and explains every bug."""
-    code = arg
-    if not code:
-        print(f"{NEON_Y}Paste your broken code (type END on a new line when done):{R}")
-        lines = []
-        while True:
-            try:
-                line = input()
-                if line.strip() == "END": break
-                lines.append(line)
-            except EOFError: break
-        code = "\n".join(lines)
+    code = _read_pasted_code(arg, "Paste your broken code (type END on a new line when done):")
     if not code: return ""
     return ask(cfg, messages, session_msgs,
         f"Debug this code. Find EVERY bug, error, and problem:\n\n```\n{code}\n```\n\n"
@@ -2649,17 +3354,7 @@ def cmd_debug(arg: str, cfg: dict, messages: list, session_msgs: list) -> str:
 
 def cmd_review(arg: str, cfg: dict, messages: list, session_msgs: list) -> str:
     """Full code review — bugs, security, performance, style."""
-    code = arg
-    if not code:
-        print(f"{NEON_Y}Paste your code for review (END to finish):{R}")
-        lines = []
-        while True:
-            try:
-                line = input()
-                if line.strip() == "END": break
-                lines.append(line)
-            except EOFError: break
-        code = "\n".join(lines)
+    code = _read_pasted_code(arg, "Paste your code for review (END to finish):")
     if not code: return ""
     return ask(cfg, messages, session_msgs,
         f"Do a thorough code review of this code:\n\n```\n{code}\n```\n\n"
@@ -2751,6 +3446,282 @@ def cmd_gitlog(arg: str, cfg: dict, messages: list, session_msgs: list) -> str:
         f"Summarize these git commits in plain English:\n{log_text}\n\n"
         f"Tell me: 1) What features were added. 2) What was fixed. "
         f"3) Any concerning patterns. 4) Overall project health.")
+
+
+def cmd_testgen(arg: str, cfg: dict, messages: list, session_msgs: list) -> str:
+    """Paste code, AI generates unit tests for it."""
+    code = _read_pasted_code(arg, "Paste the code to generate tests for (END to finish):")
+    if not code: return ""
+    return ask(cfg, messages, session_msgs,
+        f"Write a complete test suite for this code:\n\n```\n{code}\n```\n\n"
+        f"Use pytest style. Cover: normal/expected inputs, edge cases (empty, None, "
+        f"zero, negative, huge input), and error conditions that should raise. "
+        f"Include the imports needed and brief comments explaining what each test checks. "
+        f"Output only runnable test code plus a one-line note per test group.")
+
+
+def cmd_docstring(arg: str, cfg: dict, messages: list, session_msgs: list) -> str:
+    """Paste code, AI adds docstrings + type hints without changing behavior."""
+    code = _read_pasted_code(arg, "Paste the code to document (END to finish):")
+    if not code: return ""
+    return ask(cfg, messages, session_msgs,
+        f"Add proper docstrings and type hints to this code, without changing its "
+        f"behavior:\n\n```\n{code}\n```\n\n"
+        f"Use Google-style docstrings (Args/Returns/Raises). Add type hints to every "
+        f"function signature. Output the full updated code, nothing else.")
+
+
+def cmd_complexity(arg: str, cfg: dict, messages: list, session_msgs: list) -> str:
+    """Paste code, AI analyzes time/space complexity (Big-O)."""
+    code = _read_pasted_code(arg, "Paste the code to analyze (END to finish):")
+    if not code: return ""
+    return ask(cfg, messages, session_msgs,
+        f"Analyze the time and space complexity of this code:\n\n```\n{code}\n```\n\n"
+        f"For each function: give Big-O time and space complexity, explain WHY "
+        f"(which lines/loops drive it), point out the worst-case input, and suggest "
+        f"a faster approach if one exists (with its own Big-O).")
+
+
+def cmd_gitdiff(arg: str, cfg: dict, messages: list, session_msgs: list) -> str:
+    """AI reviews your uncommitted git changes before you commit."""
+    staged_only = arg.strip().lower() in ("staged", "cached", "--staged", "--cached")
+    diff_cmd = ["git", "diff", "--cached"] if staged_only else ["git", "diff"]
+    r = subprocess.run(diff_cmd, capture_output=True, text=True, cwd=os.getcwd())
+    if r.returncode != 0:
+        print(f"\n{NEON_R}✗ Not inside a git repository.{R}\n"); return ""
+    diff = r.stdout.strip()
+    if not diff and not staged_only:
+        # nothing unstaged — fall back to staged changes automatically
+        r2 = subprocess.run(["git", "diff", "--cached"], capture_output=True, text=True, cwd=os.getcwd())
+        diff = r2.stdout.strip()
+    if not diff:
+        print(f"\n{NEON_Y}No changes found (working tree clean).{R}\n"); return ""
+
+    w = min(cols(), 68)
+    print(f"\n{NEON_C}{'─'*w}")
+    print(f"{NEON_C}{BOLD}  🔍 Reviewing {len(diff.splitlines())} diff line(s){R}")
+    print(f"{NEON_C}{'─'*w}{R}\n")
+
+    return ask(cfg, messages, session_msgs,
+        f"Review this git diff before I commit it:\n\n```diff\n{diff[:6000]}\n```\n\n"
+        f"Flag: 🐛 bugs introduced, 🔐 secrets/credentials accidentally included, "
+        f"⚠️ risky changes (deletions, broad refactors), and 💬 anything unclear. "
+        f"End with a one-line verdict: SAFE TO COMMIT / FIX FIRST.")
+
+
+def cmd_commitmsg(arg: str, cfg: dict, messages: list, session_msgs: list) -> str:
+    """Generate a conventional commit message from staged (or all) changes."""
+    r = subprocess.run(["git", "diff", "--cached"], capture_output=True, text=True, cwd=os.getcwd())
+    if r.returncode != 0:
+        print(f"\n{NEON_R}✗ Not inside a git repository.{R}\n"); return ""
+    diff = r.stdout.strip()
+    if not diff:
+        r2 = subprocess.run(["git", "diff"], capture_output=True, text=True, cwd=os.getcwd())
+        diff = r2.stdout.strip()
+        if diff:
+            print(f"{DIM}  (nothing staged — using unstaged changes){R}")
+    if not diff:
+        print(f"\n{NEON_Y}No changes to describe (working tree clean).{R}\n"); return ""
+
+    return ask(cfg, messages, session_msgs,
+        f"Write a conventional commit message for this diff:\n\n```diff\n{diff[:6000]}\n```\n\n"
+        f"Format: '<type>(<scope>): <subject>' on the first line (feat/fix/refactor/docs/"
+        f"test/chore/perf/style), 50 chars max for the subject. Then a blank line, then "
+        f"2-4 bullet points explaining WHAT changed and WHY. Output ONLY the commit "
+        f"message, nothing else — no preamble." + (f"\n\nContext from user: {arg}" if arg else ""))
+
+
+def cmd_todo(arg: str, cfg: dict, messages: list, session_msgs: list) -> str:
+    """Scan a file/directory for TODO/FIXME/HACK/XXX comments."""
+    path = os.path.expanduser(arg.strip()) if arg.strip() else os.getcwd()
+    if not os.path.exists(path):
+        print(f"\n{NEON_R}✗ Not found: {path}{R}\n"); return ""
+
+    pattern = re.compile(r"(TODO|FIXME|HACK|XXX|BUG)[:\s](.{0,120})", re.IGNORECASE)
+    hits = []
+    files = [path] if os.path.isfile(path) else []
+    if os.path.isdir(path):
+        for root, dirs, fnames in os.walk(path):
+            dirs[:] = [d for d in dirs if d not in (".git","node_modules","__pycache__",".venv","venv")]
+            for fn in fnames:
+                if os.path.splitext(fn)[1] in RAG_TEXT_EXTS:
+                    files.append(os.path.join(root, fn))
+
+    for fp in files[:1000]:
+        try:
+            with open(fp, "r", errors="ignore") as f:
+                for i, line in enumerate(f, 1):
+                    m = pattern.search(line)
+                    if m:
+                        hits.append((fp, i, m.group(1).upper(), m.group(2).strip()))
+        except Exception:
+            continue
+
+    w = min(cols(), 74)
+    print(f"\n{NEON_C}{'─'*w}")
+    print(f"{NEON_C}{BOLD}  📌 Found {len(hits)} marker(s){R}")
+    print(f"{NEON_C}{'─'*w}{R}")
+    if not hits:
+        print(f"{DIM}  Clean — nothing found.{R}\n"); return ""
+
+    tag_color = {"TODO": NEON_C, "FIXME": NEON_Y, "HACK": NEON_O, "XXX": NEON_R, "BUG": NEON_R}
+    for fp, ln, tag, text in hits[:200]:
+        rel = os.path.relpath(fp, os.getcwd()) if os.path.isdir(path) else fp
+        c = tag_color.get(tag, NEON_C)
+        print(f"  {c}{BOLD}{tag:<6}{R} {DIM}{rel}:{ln}{R}  {text[:70]}")
+    print()
+    if len(hits) > 200:
+        print(f"{DIM}  … and {len(hits)-200} more (truncated){R}\n")
+
+    summary = "\n".join(f"{tag} {os.path.relpath(fp, os.getcwd()) if os.path.isdir(path) else fp}:{ln} — {text}"
+                         for fp, ln, tag, text in hits[:200])
+    return ask(cfg, messages, session_msgs,
+        f"Here are TODO/FIXME/HACK markers found in the codebase:\n\n{summary[:6000]}\n\n"
+        f"Group them by theme, flag anything that looks like a real bug or security "
+        f"risk (not just a style note), and suggest which 3 to tackle first.")
+
+
+GITIGNORE_TEMPLATES = {
+    "python":  "__pycache__/\n*.py[cod]\n*.egg-info/\n.venv/\nvenv/\n.env\ndist/\nbuild/\n.pytest_cache/\n.mypy_cache/\n",
+    "node":    "node_modules/\nnpm-debug.log*\n.env\ndist/\nbuild/\n.next/\ncoverage/\n",
+    "rust":    "target/\nCargo.lock\n",
+    "go":      "bin/\n*.exe\nvendor/\n",
+    "java":    "target/\n*.class\n.gradle/\nbuild/\n",
+}
+
+def cmd_gitignore(arg: str, cfg: dict, messages: list, session_msgs: list) -> str:
+    """Generate a .gitignore for a stack, optionally write it to the cwd."""
+    stack = arg.strip().lower()
+    if not stack:
+        print(f"{NEON_Y}Usage: /gitignore <stack>   e.g. /gitignore python{R}")
+        print(f"{DIM}  Built-in: {', '.join(GITIGNORE_TEMPLATES)}  (anything else asks the AI){R}\n")
+        return ""
+
+    base = GITIGNORE_TEMPLATES.get(stack, "")
+    if not base:
+        # not a built-in template — ask the AI to write one
+        return ask(cfg, messages, session_msgs,
+            f"Write a complete, production-quality .gitignore for a {stack} project. "
+            f"Output ONLY the file content, no explanation, no markdown fences.")
+
+    common = "\n# OS/editor\n.DS_Store\n*.swp\n.vscode/\n.idea/\n"
+    content = base + common
+    print(f"\n{DIM}{content}{R}")
+    print(f"{NEON_Y}Write this to ./.gitignore? [y/N]: {R}", end="")
+    if input().strip().lower() == "y":
+        dest = os.path.join(os.getcwd(), ".gitignore")
+        mode = "a" if os.path.exists(dest) else "w"
+        with open(dest, mode) as f:
+            if mode == "a": f.write("\n")
+            f.write(content)
+        print(f"{NEON_G}✓ {'Appended to' if mode=='a' else 'Wrote'} {dest}{R}\n")
+    return ""
+
+
+LICENSE_TEMPLATES = {
+    "mit":        "MIT License",
+    "apache-2.0": "Apache License 2.0",
+    "gpl-3.0":    "GNU General Public License v3.0",
+    "bsd-3":      "BSD 3-Clause License",
+    "unlicense":  "The Unlicense",
+}
+
+def cmd_license(arg: str, cfg: dict, messages: list, session_msgs: list) -> str:
+    """Generate a LICENSE file for the current project."""
+    parts_ = arg.split(maxsplit=1)
+    ltype  = (parts_[0].lower() if parts_ else "")
+    holder = parts_[1] if len(parts_) > 1 else "neo4"
+
+    if ltype not in LICENSE_TEMPLATES:
+        print(f"{NEON_Y}Usage: /license <type> [holder name]{R}")
+        print(f"{DIM}  Types: {', '.join(LICENSE_TEMPLATES)}{R}\n")
+        return ""
+
+    year = datetime.date.today().year
+    resp = ask(cfg, messages, session_msgs,
+        f"Output the full, exact, standard text of the {LICENSE_TEMPLATES[ltype]}, "
+        f"with copyright year {year} and copyright holder \"{holder}\" filled in "
+        f"where the template requires it. Output ONLY the license text, nothing else.")
+    if resp:
+        print(f"{NEON_Y}Write this to ./LICENSE? [y/N]: {R}", end="")
+        if input().strip().lower() == "y":
+            with open(os.path.join(os.getcwd(), "LICENSE"), "w") as f:
+                f.write(resp.strip() + "\n")
+            print(f"{NEON_G}✓ Wrote LICENSE{R}\n")
+    return resp
+
+
+def cmd_lint(arg: str, cfg: dict, messages: list, session_msgs: list) -> str:
+    """Run a real linter on a file if one's installed, then AI explains the findings."""
+    if not arg:
+        print(f"{NEON_Y}Usage: /lint <file>{R}\n"); return ""
+    path = os.path.expanduser(arg.strip())
+    if not os.path.exists(path):
+        print(f"\n{NEON_R}✗ Not found: {path}{R}\n"); return ""
+
+    ext = os.path.splitext(path)[1]
+    linter_cmds = {
+        ".py":  [["ruff", "check", path], ["flake8", path], ["pylint", path]],
+        ".js":  [["eslint", path]],
+        ".ts":  [["eslint", path]],
+        ".sh":  [["shellcheck", path]],
+    }
+    output, used = None, None
+    for cmd in linter_cmds.get(ext, []):
+        if shutil.which(cmd[0]):
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            output = (r.stdout + r.stderr).strip()
+            used = cmd[0]
+            break
+
+    if output is None:
+        print(f"{NEON_Y}⚠ No linter installed for {ext or 'this filetype'} — "
+              f"falling back to an AI-only review.{R}\n")
+        with open(path, "r", errors="ignore") as f:
+            code = f.read()[:6000]
+        return ask(cfg, messages, session_msgs,
+            f"Act as a strict linter for this code:\n\n```\n{code}\n```\n\n"
+            f"List every style issue, unused variable/import, and likely bug, "
+            f"in a compact list format like a real linter's output.")
+
+    print(f"\n{DIM}{used} output:{R}")
+    print(output[:3000] or f"{NEON_G}✓ No issues found.{R}")
+    if not output.strip():
+        return ""
+    return ask(cfg, messages, session_msgs,
+        f"Here is raw {used} output on {os.path.basename(path)}:\n\n{output[:4000]}\n\n"
+        f"Explain the top 5 most important findings in plain English and show the fix "
+        f"for each. Ignore pure nitpicks (line length etc.) unless nothing else is found.")
+
+
+def cmd_profile(arg: str, cfg: dict, messages: list, session_msgs: list) -> str:
+    """Run cProfile on a Python script and have the AI summarize the hotspots."""
+    if not arg:
+        print(f"{NEON_Y}Usage: /profile <script.py> [args...]{R}\n"); return ""
+    parts_ = arg.split()
+    script = os.path.expanduser(parts_[0])
+    if not os.path.exists(script):
+        print(f"\n{NEON_R}✗ Not found: {script}{R}\n"); return ""
+    if not script.endswith(".py"):
+        print(f"\n{NEON_Y}⚠ /profile currently only supports Python scripts.{R}\n"); return ""
+
+    print(f"\n{NEON_C}⏱ Profiling {os.path.basename(script)}…{R}\n")
+    r = subprocess.run(
+        [sys.executable, "-m", "cProfile", "-s", "cumulative"] + parts_,
+        capture_output=True, text=True, timeout=60
+    )
+    out = (r.stdout + r.stderr).strip()
+    if not out:
+        print(f"{NEON_R}✗ No profiler output (script may have crashed).{R}\n"); return ""
+
+    lines = out.splitlines()
+    top = "\n".join(lines[:35])
+    print(f"{DIM}{top}{R}\n")
+
+    return ask(cfg, messages, session_msgs,
+        f"Here is cProfile output for {os.path.basename(script)}:\n\n{top}\n\n"
+        f"Identify the top 3 performance hotspots (by cumulative time), explain "
+        f"likely causes in plain English, and suggest concrete optimizations.")
 
 
 
@@ -3374,7 +4345,9 @@ def setup_wizard(cfg: dict) -> None:
 
     save_cfg(cfg)
     print(f"\n{NEON_G}✓ Setup complete!{R}")
-    print(f"  Run: {NEON_C}python3 {sys.argv[0]}{R}\n")
+    print(f"  Run: {NEON_C}python3 {sys.argv[0]}{R}")
+    print(f"\n{DIM}New: /agent mode now auto-loops tool calls, /see gives you vision "
+          f"(run '/see setup'), /rag builds a local knowledge base.{R}\n")
 
 # ══════════════════════════════════════════════════════════════
 #  IMAGE GENERATION — Stable Diffusion via diffusers (CPU/GPU)
@@ -3920,6 +4893,25 @@ def wa_auto_inject(user_input: str, cfg: dict, messages: list, session_msgs: lis
 # ══════════════════════════════════════════════════════════════
 #  CORE ASK
 # ══════════════════════════════════════════════════════════════
+def _stream_one_turn(cfg: dict, messages: list) -> str:
+    """Stream a single model turn to stdout, return the full text (or '' on error)."""
+    full_response = []; token_count = 0; start = time.time()
+    try:
+        for token in stream_local(cfg, messages):
+            sys.stdout.write(token); sys.stdout.flush()
+            full_response.append(token); token_count += 1
+    except KeyboardInterrupt:
+        print(f"\n{NEON_Y}[interrupted]{R}")
+        return "".join(full_response)
+    except Exception as e:
+        print(f"\n{NEON_R}✗ {e}{R}")
+        return ""
+    elapsed = time.time() - start
+    tok_s   = token_count / elapsed if elapsed > 0 else 0
+    print(f"\n\n{DIM}  ⏱ {elapsed:.1f}s · {token_count} tokens · {tok_s:.1f} tok/s{R}\n")
+    return "".join(full_response)
+
+
 def ask(cfg: dict, messages: list, session_msgs: list,
         user_input: str, prefix: str = "") -> str:
 
@@ -3930,37 +4922,61 @@ def ask(cfg: dict, messages: list, session_msgs: list,
     mode = MODES.get(cfg.get("mode","chat"), MODES["chat"])
     mc   = mode["color"]
     bw   = min(cols(), 62)
-
-    full_response = []; token_count = 0; start = time.time()
+    is_agent_mode = cfg.get("mode") == "agent"
+    max_iters     = max(1, int(cfg.get("max_agent_iters", 6)))
 
     print(f"\n{mc}{'▓'*bw}{R}")
     print(f"{mc}{BOLD}  {mode['icon']} {mode['label']}{R}")
     print(f"{mc}{'▓'*bw}{R}\n")
 
-    try:
-        for token in stream_local(cfg, messages):
-            sys.stdout.write(token); sys.stdout.flush()
-            full_response.append(token); token_count += 1
-    except KeyboardInterrupt:
-        print(f"\n{NEON_Y}[interrupted]{R}")
-    except Exception as e:
-        print(f"\n{NEON_R}✗ {e}{R}")
+    response = _stream_one_turn(cfg, messages)
+    if not response:
         messages.pop(); session_msgs.pop()
         return ""
 
-    elapsed  = time.time() - start
-    response = "".join(full_response)
     messages.append({"role":"assistant","content":response})
     session_msgs.append({"role":"assistant","content":response})
+
+    # ── Real tool-calling loop ─────────────────────────────────
+    # Read-only tool results (search_files/read_file/web_search/rag_search)
+    # get fed straight back to the model automatically, up to max_iters times,
+    # so the agent can act on what it learned without the user repeating itself.
+    # Destructive actions still stop the loop to wait for explicit approval.
+    iters = 0
+    last_response = response
+    while is_agent_mode and iters < max_iters:
+        actions = parse_actions(last_response)
+        if not actions:
+            break
+
+        action_results = process_actions(last_response, cfg)
+        if not action_results:
+            break
+
+        messages.append({"role":"user","content":f"[SYSTEM] Tool results:\n{action_results}"})
+        session_msgs.append({"role":"user","content":f"[SYSTEM] Tool results:\n{action_results}"})
+
+        iters += 1
+        print(f"{DIM}  ↻ agent continuing — round {iters}/{max_iters}…{R}\n")
+
+        last_response = _stream_one_turn(cfg, messages)
+        if not last_response:
+            break
+        messages.append({"role":"assistant","content":last_response})
+        session_msgs.append({"role":"assistant","content":last_response})
+        response = last_response
+
+    if iters >= max_iters:
+        print(f"{NEON_Y}  ⚠ Hit max agent rounds ({max_iters}). Ask a follow-up to continue.{R}\n")
+
+    # non-agent modes (or the final agent round) still get one pass of
+    # process_actions so a stray ACTION block doesn't just get ignored.
+    if not is_agent_mode:
+        action_results = process_actions(response, cfg)
+        if action_results:
+            messages.append({"role":"user","content":f"[SYSTEM] Results:\n{action_results}"})
+
     save_history(cfg["history_file"], session_msgs, cfg["max_history"])
-
-    tok_s = token_count / elapsed if elapsed > 0 else 0
-    print(f"\n\n{DIM}  ⏱ {elapsed:.1f}s · {token_count} tokens · {tok_s:.1f} tok/s{R}\n")
-
-    action_results = process_actions(response)
-    if action_results:
-        messages.append({"role":"user","content":f"[SYSTEM] Results:\n{action_results}"})
-
     return response
 
 # ══════════════════════════════════════════════════════════════
@@ -3976,6 +4992,7 @@ def repl(cfg: dict, one_shot: str | None = None) -> None:
         print_banner(cfg)
 
     mem          = load_memory()
+    load_plugins(cfg, verbose=not one_shot)
     mode         = MODES.get(cfg.get("mode","chat"), MODES["chat"])
     messages     = [{"role":"system","content":""}]   # placeholder, filled below
     session_msgs : list = []
@@ -4064,7 +5081,7 @@ def repl(cfg: dict, one_shot: str | None = None) -> None:
                 cmd_goals(action, arg2)
         elif cmd in ("/exit","/quit","/q"):
             print(f"\n{DIM}Stay safe out there.{R}\n"); break
-        elif cmd == "/help":     print_help()
+        elif cmd == "/help":     print_help(arg)
         elif cmd == "/save":     save_cfg(cfg)
         elif cmd == "/clear":
             mode = MODES.get(cfg.get("mode","chat"),MODES["chat"])
@@ -4235,6 +5252,13 @@ def repl(cfg: dict, one_shot: str | None = None) -> None:
             cmd_websites()
         elif cmd == "/fetchforget":
             cmd_webforget(arg)
+        elif cmd == "/see":
+            cmd_vision(arg, cfg)
+        elif cmd == "/rag":
+            parts2  = arg.split(maxsplit=1)
+            raction = parts2[0] if parts2 else ""
+            rarg    = parts2[1] if len(parts2) > 1 else ""
+            last_response = cmd_rag(raction, rarg, cfg, messages, session_msgs)
         # ── developer tools ──────────────────────────────────
         elif cmd == "/debug":
             last_response = cmd_debug(arg, cfg, messages, session_msgs)
@@ -4244,6 +5268,26 @@ def repl(cfg: dict, one_shot: str | None = None) -> None:
             last_response = cmd_template(arg, cfg, messages, session_msgs)
         elif cmd == "/gitlog":
             last_response = cmd_gitlog(arg, cfg, messages, session_msgs)
+        elif cmd == "/testgen":
+            last_response = cmd_testgen(arg, cfg, messages, session_msgs)
+        elif cmd == "/docstring":
+            last_response = cmd_docstring(arg, cfg, messages, session_msgs)
+        elif cmd == "/complexity":
+            last_response = cmd_complexity(arg, cfg, messages, session_msgs)
+        elif cmd == "/gitdiff":
+            last_response = cmd_gitdiff(arg, cfg, messages, session_msgs)
+        elif cmd == "/commitmsg":
+            last_response = cmd_commitmsg(arg, cfg, messages, session_msgs)
+        elif cmd == "/todo":
+            last_response = cmd_todo(arg, cfg, messages, session_msgs)
+        elif cmd == "/gitignore":
+            last_response = cmd_gitignore(arg, cfg, messages, session_msgs)
+        elif cmd == "/license":
+            last_response = cmd_license(arg, cfg, messages, session_msgs)
+        elif cmd == "/lint":
+            last_response = cmd_lint(arg, cfg, messages, session_msgs)
+        elif cmd == "/profile":
+            last_response = cmd_profile(arg, cfg, messages, session_msgs)
         # ── security tools ───────────────────────────────────
         elif cmd == "/hash":
             last_response = cmd_hash(arg, cfg, messages, session_msgs)
@@ -4313,6 +5357,19 @@ def repl(cfg: dict, one_shot: str | None = None) -> None:
                     print(f"\n{NEON_G}✓ Downloaded! Restart to use new model.{R}\n")
                 else:
                     print(f"{NEON_R}✗ Download failed.{R}\n")
+        elif cmd == "/plugins":
+            parts2  = arg.split(maxsplit=1)
+            paction = parts2[0] if parts2 else ""
+            parg    = parts2[1] if len(parts2) > 1 else ""
+            cmd_plugins(paction, parg, cfg)
+        elif cmd in PLUGIN_COMMANDS:
+            plugin_ctx = {"cfg": cfg, "messages": messages, "session_msgs": session_msgs, "ask": ask}
+            try:
+                result = PLUGIN_COMMANDS[cmd]["handler"](arg, plugin_ctx)
+                if result:
+                    last_response = result
+            except Exception as e:
+                print(f"{NEON_R}✗ Plugin command '{cmd}' error: {e}{R}\n")
         else:
             print(f"{NEON_R}Unknown: {cmd}{R} — /help\n")
 
