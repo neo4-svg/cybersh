@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# version: 1.6
+# version: 1.7
 """
  ██████╗██╗   ██╗██████╗ ███████╗██████╗     ███████╗██╗  ██╗
 ██╔════╝╚██╗ ██╔╝██╔══██╗██╔════╝██╔══██╗    ██╔════╝██║  ██║
@@ -643,6 +643,8 @@ DEFAULT_CFG = {
     "vision_model_path": "",   # multimodal .gguf (e.g. moondream2)
     "vision_mmproj_path": "",  # matching --mmproj clip projector file
     "rag_enabled":    True,    # allow /rag commands to build a local index
+    "prompt_cache_enabled": True,  # cache KV-state directly on the loaded gguf model in RAM
+    "prompt_cache_mb": 256,        # RAM budget for that cache, per loaded model
 }
 
 # well-known GGUF download links (free, official)
@@ -827,6 +829,7 @@ def get_vision_llm(cfg: dict):
         logits_all   = True,   # required by some llava chat handlers
         verbose      = False,
     )
+    _attach_prompt_cache(_vision_llm_instance, cfg, label="vision model")
     return _vision_llm_instance
 
 def cmd_vision(arg: str, cfg: dict) -> None:
@@ -958,6 +961,7 @@ def get_embedder(cfg: dict):
         embedding  = True,
         verbose    = False,
     )
+    _attach_prompt_cache(_embed_instance, cfg, label="RAG embedder")
     return _embed_instance
 
 def embed_text(text: str, cfg: dict) -> list:
@@ -996,19 +1000,36 @@ def chunk_text(text: str, size: int = RAG_CHUNK_SIZE, overlap: int = RAG_OVERLAP
         i += max(1, size - overlap)
     return chunks
 
+_RAG_INDEX_CACHE  = None   # in-RAM mirror of index.json — avoids re-reading the sub-file on every /rag call
+_RAG_INDEX_MTIME  = None
+
 def rag_load_index() -> list:
+    """Return the RAG index, served from RAM whenever the on-disk sub-file
+    hasn't changed since the last read. index/search/ask all funnel through
+    here, so after the first read a whole /rag session runs off the cached
+    copy instead of hitting disk every time."""
+    global _RAG_INDEX_CACHE, _RAG_INDEX_MTIME
     if not os.path.exists(RAG_INDEX_PATH):
+        _RAG_INDEX_CACHE, _RAG_INDEX_MTIME = [], None
         return []
     try:
+        mtime = os.path.getmtime(RAG_INDEX_PATH)
+        if _RAG_INDEX_CACHE is not None and mtime == _RAG_INDEX_MTIME:
+            return _RAG_INDEX_CACHE
         with open(RAG_INDEX_PATH) as f:
-            return json.load(f)
+            _RAG_INDEX_CACHE = json.load(f)
+        _RAG_INDEX_MTIME = mtime
+        return _RAG_INDEX_CACHE
     except Exception:
-        return []
+        return _RAG_INDEX_CACHE or []
 
 def rag_save_index(index: list) -> None:
+    global _RAG_INDEX_CACHE, _RAG_INDEX_MTIME
     _ensure_rag_dir()
     with open(RAG_INDEX_PATH, "w") as f:
         json.dump(index, f)
+    _RAG_INDEX_CACHE = index
+    _RAG_INDEX_MTIME = os.path.getmtime(RAG_INDEX_PATH)
 
 def rag_index_path(path: str, cfg: dict) -> str:
     """Index a file or directory into the local RAG store. Returns a status string."""
@@ -1147,10 +1168,26 @@ MODES = {
     "code": {
         "icon": "⚡", "label": "CODE", "color": NEON_Y,
         "system": (
-            "You are an elite software engineer — write production-grade code a senior dev "
-            "would ship. Add proper error handling, type hints where relevant, comments only "
-            "where they add real value, and a short usage example. Prefer clear correct code "
-            "over clever code. You are excellent at security-aware coding too."
+            "You are an elite, principal-level software engineer — write production-grade "
+            "code a senior dev would ship straight to review with no changes requested. "
+            "Rules for every answer:\n"
+            "1) Default to complete, runnable files, not fragments or diffs, unless the user "
+            "explicitly asks for a patch/snippet — assume they'll copy-paste and run it as-is.\n"
+            "2) Think about the whole system before writing: correctness, edge cases (empty "
+            "input, huge input, concurrency, network failure, malformed data), and how this "
+            "code will be used and maintained six months from now.\n"
+            "3) Add proper error handling and, for Python, type hints — never let an exception "
+            "propagate somewhere the user can't understand it.\n"
+            "4) Comment only where it adds real value (why, not what). Include a short usage "
+            "example so the user can run it immediately.\n"
+            "5) Call out security-relevant issues unprompted (injection, unsafe deserialization, "
+            "path traversal, secrets in code, shell=True, etc.) — you are excellent at "
+            "security-aware coding, not just feature coding.\n"
+            "6) Flag real performance/complexity concerns (Big-O, N+1 queries, blocking I/O) "
+            "when they matter for the input sizes implied by the request.\n"
+            "7) Prefer clear, boring, correct code over clever code. If there's a real tradeoff "
+            "(speed vs. readability, memory vs. simplicity), state it in one line instead of "
+            "silently picking one."
         ) + _GLOBAL_RULES,
     },
     "agent": {
@@ -1183,6 +1220,32 @@ MODES = {
 #  LLAMA CPP WRAPPER
 # ══════════════════════════════════════════════════════════════
 _llm_instance = None
+
+def _attach_prompt_cache(llm, cfg: dict, label: str = "model") -> None:
+    """Feed the model's computed context state directly into RAM on the
+    loaded .gguf instance itself, instead of the old path of round-tripping
+    through an on-disk sub-file every turn (RAG index, history JSON, etc.)
+    and letting llama.cpp re-walk the whole prompt from scratch.
+
+    llama-cpp-python exposes this via Llama.set_cache(LlamaCache(...)) —
+    it keeps recently-seen prompt prefixes (system prompt, RAG context,
+    conversation history) resident in RAM against THIS model object, so a
+    new turn that shares a prefix with a previous one only has to evaluate
+    the new tail instead of the entire prompt. That's the real speed win:
+    no extra file, no serialization — the cache lives directly on the gguf
+    model in memory for as long as the process is alive.
+    """
+    if not cfg.get("prompt_cache_enabled", True):
+        return
+    try:
+        from llama_cpp import LlamaCache
+        cache_mb = max(32, int(cfg.get("prompt_cache_mb", 256)))
+        llm.set_cache(LlamaCache(capacity_bytes=cache_mb * 1024 * 1024))
+        print(f"{DIM}  ⚡ In-RAM prompt cache attached to {label} ({cache_mb}MB, direct-to-gguf){R}")
+    except ImportError:
+        pass  # LlamaCache not present in this llama-cpp-python build — skip silently
+    except Exception:
+        pass  # never let a cache failure block model load
 
 def get_llm(cfg: dict):
     global _llm_instance
@@ -1247,6 +1310,7 @@ def get_llm(cfg: dict):
         n_gpu_layers = n_gpu_layers,
         verbose      = False,
     )
+    _attach_prompt_cache(_llm_instance, cfg, label="chat model")
     print(f"{NEON_G}✓ Model ready!{R}\n")
     return _llm_instance
 
@@ -1901,13 +1965,13 @@ def _help_sections() -> list:
             ("/rag list | /rag clear",      "View or wipe the local RAG index"),
         ]),
         ("👨‍💻 DEVELOPER", [
-            ("/debug",                   "Paste broken code, AI finds every bug"),
-            ("/review",                  "Full code review — bugs, security, performance"),
+            ("/debug [file]",            "Paste or point at broken code, AI finds every bug"),
+            ("/review [file]",           "Full code review — bugs, security, performance"),
             ("/template flask api",      "Generate a production-ready project template"),
             ("/gitlog",                  "AI summarizes your recent git commits"),
-            ("/testgen",                 "Paste code, AI writes a pytest test suite"),
-            ("/docstring",               "Paste code, AI adds docstrings + type hints"),
-            ("/complexity",              "Big-O time/space analysis of pasted code"),
+            ("/testgen [file]",          "AI writes a pytest test suite for pasted code or a file"),
+            ("/docstring [file]",        "AI adds docstrings + type hints to pasted code or a file"),
+            ("/complexity [file]",       "Big-O time/space analysis of pasted code or a file"),
             ("/gitdiff [staged]",        "AI reviews uncommitted changes before you commit"),
             ("/commitmsg",               "Generate a conventional commit message from your diff"),
             ("/todo [path]",             "Scan for TODO/FIXME/HACK markers, AI triages them"),
@@ -2298,8 +2362,10 @@ def cmd_rag(action: str, arg: str, cfg: dict, messages: list, session_msgs: list
         return ""
 
     elif a == "clear":
+        global _RAG_INDEX_CACHE, _RAG_INDEX_MTIME
         if os.path.exists(RAG_INDEX_PATH):
             os.remove(RAG_INDEX_PATH)
+        _RAG_INDEX_CACHE, _RAG_INDEX_MTIME = [], None
         print(f"\n{NEON_G}✓ RAG index cleared.{R}\n")
         return ""
 
@@ -3328,8 +3394,23 @@ def cmd_pwcheck(arg: str, cfg: dict, messages: list, session_msgs: list) -> str:
 # ══════════════════════════════════════════════════════════════
 
 def _read_pasted_code(arg: str, prompt: str = "Paste your code (type END on a new line when done):") -> str:
-    """Shared helper: use inline arg if given, else read multi-line paste until END."""
+    """Shared helper for /review, /testgen, /docstring, /complexity, /lint, /debug.
+    If arg is a path to a real file, feed that file's actual content straight
+    in — no copy-paste needed for anything already on disk. Otherwise treat
+    arg as inline code text, or fall back to a multi-line paste until END."""
     if arg:
+        candidate = os.path.expanduser(arg.strip())
+        if os.path.isfile(candidate):
+            try:
+                if os.path.getsize(candidate) > 2_000_000:
+                    print(f"{NEON_Y}⚠ {candidate} is large — truncating to first 2MB.{R}")
+                with open(candidate, "r", errors="ignore") as f:
+                    content = f.read(2_000_000)
+                print(f"{DIM}  📄 Reading {candidate} ({len(content)} chars){R}")
+                return content
+            except Exception as e:
+                print(f"{NEON_R}✗ Could not read {candidate}: {e}{R}")
+                return ""
         return arg
     print(f"{NEON_Y}{prompt}{R}")
     lines = []
@@ -5393,7 +5474,7 @@ def main() -> None:
     parser.add_argument("--setup",       action="store_true", help="Run setup wizard")
     parser.add_argument("--update",      action="store_true", help="Force update from GitHub")
     parser.add_argument("--no-update",   action="store_true", help="Skip update check")
-    parser.add_argument("--version",     action="version", version="CYBER SH DIRECT v1.2")
+    parser.add_argument("--version",     action="version", version=f"CYBER SH DIRECT v{APP_VERSION}")
 
     args = parser.parse_args()
     cfg  = load_cfg()
