@@ -2,6 +2,8 @@
 # Install with: pip install -r requirements.txt --break-system-packages
 
 # Core — AI engine (required)
+# Also provides LlamaCache, used since v1.7 for in-RAM prompt/KV caching
+# directly on the loaded .gguf model (faster repeat/RAG-augmented turns).
 llama-cpp-python
 
 # Web search — enables /web and /cvesearch commands (recommended)
