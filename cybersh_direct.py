@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# version: 1.7
+# version: 1.8
 """
  ██████╗██╗   ██╗██████╗ ███████╗██████╗     ███████╗██╗  ██╗
 ██╔════╝╚██╗ ██╔╝██╔══██╗██╔════╝██╔══██╗    ██╔════╝██║  ██║
@@ -12,6 +12,7 @@
 
 import sys, os, json, time, shutil, re, subprocess, threading, datetime, textwrap, argparse, glob, readline
 import importlib.util
+import http.server, socketserver
 
 def _own_version() -> str:
     """Read the '# version:' header of this file so the banner never drifts out of sync."""
@@ -43,6 +44,42 @@ def _http_get(url: str, timeout: int = 10) -> str | None:
             return r.read().decode("utf-8", errors="replace")
     except Exception:
         return None
+
+def _download_file(url: str, dest: str, label: str = "") -> bool:
+    """Pure-Python file downloader with a live progress bar. Used for model
+    downloads instead of shelling out to `wget` — wget isn't installed by
+    default on Windows, so relying on it silently broke every download
+    (/models, --setup, /see setup) on a stock Windows machine."""
+    import urllib.request, ssl
+    label = label or os.path.basename(dest)
+    tmp   = dest + ".part"
+    try:
+        ctx = ssl.create_default_context()  # verifies TLS certs — do not disable
+        req = urllib.request.Request(url, headers={"User-Agent": "cybersh-downloader/1.0"})
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp, open(tmp, "wb") as out:
+            total, done = int(resp.headers.get("Content-Length", 0) or 0), 0
+            while True:
+                chunk = resp.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+                done += len(chunk)
+                if total:
+                    pct = done * 100 // total
+                    print(f"\r  {label}: {pct}%  ({done/1e6:.0f}/{total/1e6:.0f} MB)", end="", flush=True)
+                else:
+                    print(f"\r  {label}: {done/1e6:.0f} MB", end="", flush=True)
+        print()
+        os.replace(tmp, dest)
+        return True
+    except Exception as e:
+        print(f"\n  ✗ Download failed: {e}")
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return False
 
 def _is_online() -> bool:
     import socket
@@ -325,6 +362,26 @@ NEON_O = "\033[38;5;208m"; NEON_R = "\033[38;5;196m"
 BOLD_C = f"\033[1m{NEON_C}"; BOLD_Y = f"\033[1m{NEON_Y}"
 CLEAR  = "\033[2K\r"
 
+def _enable_windows_ansi() -> None:
+    """Native cmd.exe doesn't render ANSI escape codes unless virtual
+    terminal processing is explicitly turned on. Without this, every
+    NEON_*/color constant above prints as raw garbage on plain Windows
+    consoles instead of an actual color."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+    except Exception:
+        pass
+
+_enable_windows_ansi()
+
 # ══════════════════════════════════════════════════════════════
 #  RICH INPUT BAR — Claude-style typing experience
 # ══════════════════════════════════════════════════════════════
@@ -350,6 +407,7 @@ ALL_COMMANDS = [
     "/testgen","/docstring","/complexity","/gitdiff","/commitmsg",
     "/todo","/gitignore","/license","/lint","/profile",
     "/plugins",
+    "/model","/context","/regen","/compact","/export",
     "--update","--no-update",
 ]
 
@@ -645,6 +703,7 @@ DEFAULT_CFG = {
     "rag_enabled":    True,    # allow /rag commands to build a local index
     "prompt_cache_enabled": True,  # cache KV-state directly on the loaded gguf model in RAM
     "prompt_cache_mb": 256,        # RAM budget for that cache, per loaded model
+    "auto_trim_context": True,     # drop oldest turns instead of crashing when context fills up
 }
 
 # well-known GGUF download links (free, official)
@@ -787,18 +846,22 @@ def vision_setup_wizard(cfg: dict) -> None:
     dest_c = os.path.join(dl_dir, model["mmproj_file"])
 
     print(f"\n{NEON_C}Downloading model…{R}")
-    ret1 = os.system(f'wget -c -O "{dest_m}" "{model["url"]}"')
-    print(f"\n{NEON_C}Downloading mmproj (clip projector)…{R}")
-    ret2 = os.system(f'wget -c -O "{dest_c}" "{model["mmproj_url"]}"')
+    ok1 = _download_file(model["url"], dest_m, label=model["file"])
+    print(f"{NEON_C}Downloading mmproj (clip projector)…{R}")
+    ok2 = _download_file(model["mmproj_url"], dest_c, label=model["mmproj_file"])
 
-    if ret1 == 0 and ret2 == 0 and os.path.exists(dest_m) and os.path.exists(dest_c):
+    if ok1 and ok2:
+        ok1 = _verify_model_sha256(dest_m, model.get("sha256"), model["file"])
+        ok2 = _verify_model_sha256(dest_c, model.get("mmproj_sha256"), model["mmproj_file"])
+
+    if ok1 and ok2 and os.path.exists(dest_m) and os.path.exists(dest_c):
         cfg["vision_model_path"]  = dest_m
         cfg["vision_mmproj_path"] = dest_c
         save_cfg(cfg)
         print(f"\n{NEON_G}✓ Vision model ready! Try: /see <image_path> what's in this?{R}\n")
     else:
-        print(f"{NEON_R}✗ Download failed. Try manually with wget, then run /see setup "
-              f"and point to the local files.{R}\n")
+        print(f"{NEON_R}✗ Download failed. Re-run /see setup to try again, "
+              f"or download the files manually and point to them.{R}\n")
 
 
 _vision_llm_instance = None
@@ -1000,14 +1063,12 @@ def chunk_text(text: str, size: int = RAG_CHUNK_SIZE, overlap: int = RAG_OVERLAP
         i += max(1, size - overlap)
     return chunks
 
-_RAG_INDEX_CACHE  = None   # in-RAM mirror of index.json — avoids re-reading the sub-file on every /rag call
+_RAG_INDEX_CACHE  = None
 _RAG_INDEX_MTIME  = None
 
 def rag_load_index() -> list:
     """Return the RAG index, served from RAM whenever the on-disk sub-file
-    hasn't changed since the last read. index/search/ask all funnel through
-    here, so after the first read a whole /rag session runs off the cached
-    copy instead of hitting disk every time."""
+    hasn't changed since the last read."""
     global _RAG_INDEX_CACHE, _RAG_INDEX_MTIME
     if not os.path.exists(RAG_INDEX_PATH):
         _RAG_INDEX_CACHE, _RAG_INDEX_MTIME = [], None
@@ -1223,29 +1284,23 @@ _llm_instance = None
 
 def _attach_prompt_cache(llm, cfg: dict, label: str = "model") -> None:
     """Feed the model's computed context state directly into RAM on the
-    loaded .gguf instance itself, instead of the old path of round-tripping
-    through an on-disk sub-file every turn (RAG index, history JSON, etc.)
-    and letting llama.cpp re-walk the whole prompt from scratch.
-
-    llama-cpp-python exposes this via Llama.set_cache(LlamaCache(...)) —
-    it keeps recently-seen prompt prefixes (system prompt, RAG context,
-    conversation history) resident in RAM against THIS model object, so a
-    new turn that shares a prefix with a previous one only has to evaluate
-    the new tail instead of the entire prompt. That's the real speed win:
-    no extra file, no serialization — the cache lives directly on the gguf
-    model in memory for as long as the process is alive.
-    """
+    loaded .gguf instance itself, instead of recomputing the whole prompt
+    from scratch every turn. llama-cpp-python exposes this via
+    Llama.set_cache(LlamaCache(...)) — it keeps recently-seen prompt
+    prefixes (system prompt, RAG context, conversation history) resident in
+    RAM against THIS model object, so a new turn that shares a prefix with
+    a previous one only evaluates the new tail."""
     if not cfg.get("prompt_cache_enabled", True):
         return
     try:
         from llama_cpp import LlamaCache
         cache_mb = max(32, int(cfg.get("prompt_cache_mb", 256)))
         llm.set_cache(LlamaCache(capacity_bytes=cache_mb * 1024 * 1024))
-        print(f"{DIM}  ⚡ In-RAM prompt cache attached to {label} ({cache_mb}MB, direct-to-gguf){R}")
+        print(f"{DIM}  ⚡ In-RAM prompt cache attached to {label} ({cache_mb}MB){R}")
     except ImportError:
-        pass  # LlamaCache not present in this llama-cpp-python build — skip silently
+        pass
     except Exception:
-        pass  # never let a cache failure block model load
+        pass
 
 def get_llm(cfg: dict):
     global _llm_instance
@@ -1383,6 +1438,43 @@ def _detect_gpu() -> dict:
         pass
 
     return info
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate (~4 chars/token for English) — good enough for
+    budget checks without needing to actually tokenize with the model."""
+    return max(1, len(text or "") // 4)
+
+def _messages_token_estimate(messages: list) -> int:
+    return sum(_estimate_tokens(m.get("content", "")) for m in messages)
+
+def manage_context(cfg: dict, messages: list) -> None:
+    """Keep the running conversation inside the model's context window.
+    llama-cpp-python hard-errors ('Requested tokens exceed context window')
+    once the prompt + history + max_tokens overflows n_ctx — the single most
+    common way local chat sessions crash. Instead of hitting that wall, once
+    the conversation gets close to the budget this drops the oldest
+    non-system turns and keeps the system prompt + most recent exchanges,
+    which is what actually matters for coherence in almost every chat."""
+    if not cfg.get("auto_trim_context", True):
+        return
+    budget  = cfg.get("context", 4096)
+    reserve = cfg.get("max_tokens", 2048) + 256  # room for the reply + safety margin
+    limit   = max(512, budget - reserve)
+
+    if _messages_token_estimate(messages) <= limit:
+        return
+
+    system_msgs = [m for m in messages if m["role"] == "system"]
+    convo       = [m for m in messages if m["role"] != "system"]
+    original_len = len(convo)
+
+    while len(convo) > 2 and (_messages_token_estimate(system_msgs) + _messages_token_estimate(convo)) > limit:
+        convo.pop(0)
+
+    if len(convo) < original_len:
+        messages[:] = system_msgs + convo
+        print(f"{DIM}  ⚙ Trimmed {original_len - len(convo)} older message(s) to stay inside "
+              f"the {budget}-token context window (use /context to check usage).{R}")
 
 def build_prompt(messages: list, model_path: str) -> str:
     """Build prompt string from messages list."""
@@ -1965,13 +2057,13 @@ def _help_sections() -> list:
             ("/rag list | /rag clear",      "View or wipe the local RAG index"),
         ]),
         ("👨‍💻 DEVELOPER", [
-            ("/debug [file]",            "Paste or point at broken code, AI finds every bug"),
-            ("/review [file]",           "Full code review — bugs, security, performance"),
+            ("/debug",                   "Paste broken code, AI finds every bug"),
+            ("/review",                  "Full code review — bugs, security, performance"),
             ("/template flask api",      "Generate a production-ready project template"),
             ("/gitlog",                  "AI summarizes your recent git commits"),
-            ("/testgen [file]",          "AI writes a pytest test suite for pasted code or a file"),
-            ("/docstring [file]",        "AI adds docstrings + type hints to pasted code or a file"),
-            ("/complexity [file]",       "Big-O time/space analysis of pasted code or a file"),
+            ("/testgen",                 "Paste code, AI writes a pytest test suite"),
+            ("/docstring",               "Paste code, AI adds docstrings + type hints"),
+            ("/complexity",              "Big-O time/space analysis of pasted code"),
             ("/gitdiff [staged]",        "AI reviews uncommitted changes before you commit"),
             ("/commitmsg",               "Generate a conventional commit message from your diff"),
             ("/todo [path]",             "Scan for TODO/FIXME/HACK markers, AI triages them"),
@@ -2052,6 +2144,11 @@ def _help_sections() -> list:
             ("/clear",   "Clear history"),
             ("/history", "Show history"),
             ("/temp <n>","Set temperature"),
+            ("/context", "Show context window usage"),
+            ("/compact", "AI-summarize older history to free up context"),
+            ("/regen",   "Regenerate the last response"),
+            ("/model",   "List or hot-swap the loaded model (no restart)"),
+            ("/export [html]", "Export the conversation to a file"),
             ("/info",    "Show model info"),
             ("/save",    "Save config"),
             ("/exit",    "Exit"),
@@ -3396,8 +3493,7 @@ def cmd_pwcheck(arg: str, cfg: dict, messages: list, session_msgs: list) -> str:
 def _read_pasted_code(arg: str, prompt: str = "Paste your code (type END on a new line when done):") -> str:
     """Shared helper for /review, /testgen, /docstring, /complexity, /lint, /debug.
     If arg is a path to a real file, feed that file's actual content straight
-    in — no copy-paste needed for anything already on disk. Otherwise treat
-    arg as inline code text, or fall back to a multi-line paste until END."""
+    in — no copy-paste needed for anything already on disk."""
     if arg:
         candidate = os.path.expanduser(arg.strip())
         if os.path.isfile(candidate):
@@ -4393,13 +4489,15 @@ def setup_wizard(cfg: dict) -> None:
             dest    = os.path.join(dl_dir, model["file"])
             print(f"\n{NEON_C}Downloading {model['file']}…{R}")
             print(f"{DIM}This may take a while depending on your connection{R}\n")
-            ret = os.system(f'wget -c -O "{dest}" "{model["url"]}"')
-            if ret == 0 and os.path.exists(dest):
+            ok = _download_file(model["url"], dest, label=model["file"])
+            if ok:
+                ok = _verify_model_sha256(dest, KNOWN_MODEL_SHA256.get(choice), model["file"])
+            if ok and os.path.exists(dest):
                 cfg["model_path"] = dest
                 print(f"\n{NEON_G}✓ Downloaded to: {dest}{R}")
             else:
-                print(f"{NEON_R}✗ Download failed. Try manually:{R}")
-                print(f"  wget -O ~/ollama-models/{model['file']} {model['url']}")
+                print(f"{NEON_R}✗ Download failed. Try again, or download manually:{R}")
+                print(f"  {model['url']}  →  ~/ollama-models/{model['file']}")
 
     # threads
     import multiprocessing
@@ -4999,6 +5097,7 @@ def ask(cfg: dict, messages: list, session_msgs: list,
     full_input = (prefix + "\n\n" + user_input).strip() if prefix else user_input
     messages.append({"role":"user","content":full_input})
     session_msgs.append({"role":"user","content":full_input})
+    manage_context(cfg, messages)   # keep the live prompt inside the model's context window
 
     mode = MODES.get(cfg.get("mode","chat"), MODES["chat"])
     mc   = mode["color"]
@@ -5036,6 +5135,7 @@ def ask(cfg: dict, messages: list, session_msgs: list,
 
         messages.append({"role":"user","content":f"[SYSTEM] Tool results:\n{action_results}"})
         session_msgs.append({"role":"user","content":f"[SYSTEM] Tool results:\n{action_results}"})
+        manage_context(cfg, messages)
 
         iters += 1
         print(f"{DIM}  ↻ agent continuing — round {iters}/{max_iters}…{R}\n")
@@ -5059,6 +5159,663 @@ def ask(cfg: dict, messages: list, session_msgs: list,
 
     save_history(cfg["history_file"], session_msgs, cfg["max_history"])
     return response
+
+
+def cmd_context_status(cfg: dict, messages: list) -> None:
+    """Show how much of the model's context window the live conversation
+    is using — an early warning before /auto-trim (or a hard crash) kicks in."""
+    budget = cfg.get("context", 4096)
+    used   = _messages_token_estimate(messages)
+    pct    = min(100, int(used / budget * 100)) if budget else 0
+    bar_len = 30
+    filled  = int(bar_len * pct / 100)
+    bar     = "█" * filled + "░" * (bar_len - filled)
+    color   = NEON_G if pct < 60 else (NEON_Y if pct < 85 else NEON_R)
+    print(f"\n{color}{bar}{R}  {pct}%")
+    print(f"{DIM}  ~{used:,} / {budget:,} tokens (estimate) · {len(messages)} messages "
+          f"in active context{R}")
+    if not cfg.get("auto_trim_context", True):
+        print(f"{NEON_Y}  ⚠ auto_trim_context is off in your config — long sessions can "
+              f"still hit a hard context-window error.{R}")
+    print()
+
+
+def cmd_regenerate(cfg: dict, messages: list, session_msgs: list) -> str:
+    """Redo the last AI reply — pops the previous assistant turn and re-asks
+    with the same conversation state, for when the answer wasn't quite right."""
+    if len(messages) < 2 or messages[-1]["role"] != "assistant":
+        print(f"\n{NEON_Y}Nothing to regenerate yet — ask something first.{R}\n")
+        return ""
+    messages.pop()
+    if session_msgs and session_msgs[-1]["role"] == "assistant":
+        session_msgs.pop()
+    print(f"{DIM}  ↻ Regenerating last response…{R}")
+    response = _stream_one_turn(cfg, messages)
+    if response:
+        messages.append({"role":"assistant","content":response})
+        session_msgs.append({"role":"assistant","content":response})
+        save_history(cfg["history_file"], session_msgs, cfg["max_history"])
+    return response
+
+
+def cmd_model_switch(arg: str, cfg: dict) -> None:
+    """List or hot-swap the loaded chat model — no restart required. This is
+    the single biggest ease-of-use gap next to tools like Ollama, where
+    switching models is a one-liner instead of relaunching the whole app."""
+    global _llm_instance
+    models_dir = os.path.expanduser("~/ollama-models")
+    found = []
+    if os.path.isdir(models_dir):
+        for f in sorted(os.listdir(models_dir)):
+            if f.lower().endswith(".gguf"):
+                found.append(os.path.join(models_dir, f))
+
+    if not arg:
+        current = cfg.get("model_path", "")
+        print(f"\n{NEON_C}Models in ~/ollama-models:{R}")
+        if not found:
+            print(f"{DIM}  (none found — run --setup or /models to download one){R}")
+        for i, path in enumerate(found, 1):
+            marker  = f" {NEON_G}← active{R}" if os.path.abspath(path) == os.path.abspath(current) else ""
+            size_gb = os.path.getsize(path) / 1e9
+            print(f"  {NEON_Y}{i}{R}  {os.path.basename(path)}  {DIM}({size_gb:.1f}GB){R}{marker}")
+        print(f"\n{DIM}Switch with: /model <number>, /model <name>, or /model <path>{R}\n")
+        return
+
+    target = None
+    if arg.strip().isdigit():
+        idx = int(arg.strip()) - 1
+        if 0 <= idx < len(found):
+            target = found[idx]
+    else:
+        candidate = os.path.expanduser(arg.strip())
+        if os.path.isfile(candidate):
+            target = candidate
+        else:
+            for path in found:
+                if arg.strip().lower() in os.path.basename(path).lower():
+                    target = path
+                    break
+
+    if not target:
+        print(f"\n{NEON_R}✗ Model not found. Run /model with no argument to see what's available.{R}\n")
+        return
+
+    print(f"\n{NEON_C}Switching to {os.path.basename(target)}…{R}")
+    cfg["model_path"] = target
+    save_cfg(cfg)
+    _llm_instance = None  # drop the old loaded model so get_llm() reloads fresh
+    get_llm(cfg)
+
+
+def cmd_compact(cfg: dict, messages: list) -> None:
+    """AI-summarize older conversation turns into a single compact summary,
+    freeing up context budget while preserving what actually matters —
+    smarter than the automatic /context trim, which just drops history.
+    Only affects the live prompt (`messages`); the full saved session
+    transcript is untouched."""
+    system_msgs = [m for m in messages if m["role"] == "system"]
+    convo       = [m for m in messages if m["role"] != "system"]
+
+    if len(convo) <= 4:
+        print(f"\n{NEON_Y}Not enough history yet to compact.{R}\n")
+        return
+
+    keep_tail    = convo[-2:]           # leave the most recent exchange intact
+    to_summarize = convo[:-2]
+    transcript   = "\n\n".join(f"{m['role'].upper()}: {m['content']}" for m in to_summarize)[:12000]
+
+    print(f"\n{DIM}  ⚙ Compacting {len(to_summarize)} older message(s) into a summary…{R}\n")
+    summary_prompt = [
+        {"role": "system", "content": (
+            "Summarize the following conversation concisely, preserving any decisions, "
+            "facts, file paths, code snippets, or commitments made. Write it as a compact "
+            "briefing for someone continuing the conversation, not a transcript.")},
+        {"role": "user", "content": transcript},
+    ]
+    summary = _stream_one_turn(cfg, summary_prompt)
+    if not summary:
+        print(f"{NEON_R}✗ Compaction failed — history left unchanged.{R}\n")
+        return
+
+    before = _messages_token_estimate(convo)
+    compacted = system_msgs + [{"role": "user",
+        "content": f"[Conversation summary so far]\n{summary}"}] + keep_tail
+    messages[:] = compacted
+    after = _messages_token_estimate(compacted)
+    print(f"\n{NEON_G}✓ Compacted: ~{before:,} → ~{after:,} tokens in active context.{R}\n")
+
+
+def cmd_export(arg: str, session_msgs: list) -> None:
+    """Export the full conversation transcript to a Markdown or HTML file
+    in the current directory."""
+    if not session_msgs:
+        print(f"\n{NEON_Y}Nothing to export yet.{R}\n")
+        return
+    fmt   = "html" if arg.strip().lower() == "html" else "md"
+    ts    = time.strftime("%Y%m%d_%H%M%S")
+    dest  = os.path.join(os.getcwd(), f"cybersh_export_{ts}.{fmt}")
+
+    try:
+        if fmt == "md":
+            parts = [f"# CyberSH conversation — {time.strftime('%Y-%m-%d %H:%M')}\n"]
+            for m in session_msgs:
+                if m["role"] == "system":
+                    continue
+                who = "You" if m["role"] == "user" else "AI"
+                parts.append(f"**{who}:**\n\n{m['content']}\n")
+            content = "\n---\n\n".join(parts)
+        else:
+            import html as _html
+            rows = []
+            for m in session_msgs:
+                if m["role"] == "system":
+                    continue
+                who = "You" if m["role"] == "user" else "AI"
+                rows.append(f"<div class='msg {m['role']}'><b>{who}:</b>"
+                            f"<pre>{_html.escape(m['content'])}</pre></div>")
+            content = (
+                "<html><head><meta charset='utf-8'><title>CyberSH export</title>"
+                "<style>body{font-family:sans-serif;background:#0d0d0d;color:#ddd;padding:2em}"
+                ".msg{margin-bottom:1.5em;padding:1em;border-radius:8px;background:#1a1a1a}"
+                ".user{border-left:4px solid #00e5ff}.assistant{border-left:4px solid #39ff14}"
+                "pre{white-space:pre-wrap;word-wrap:break-word}</style></head><body>"
+                f"<h1>CyberSH conversation — {time.strftime('%Y-%m-%d %H:%M')}</h1>"
+                + "".join(rows) + "</body></html>"
+            )
+        with open(dest, "w", encoding="utf-8") as f:
+            f.write(content)
+        print(f"\n{NEON_G}✓ Exported {len([m for m in session_msgs if m['role']!='system'])} "
+              f"messages → {dest}{R}\n")
+    except Exception as e:
+        print(f"\n{NEON_R}✗ Export failed: {e}{R}\n")
+
+
+# ══════════════════════════════════════════════════════════════
+#  GUI — local browser-based interface (stdlib only, no extra deps)
+# ══════════════════════════════════════════════════════════════
+GUI_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CYBER SH DIRECT</title>
+<style>
+  :root {
+    --bg: #0a0a0f; --panel: #11121a; --panel2: #171826; --border: #232336;
+    --text: #e6e6f0; --dim: #7a7a94;
+    --green: #39ff14; --cyan: #00e5ff; --purple: #b026ff; --yellow: #ffe066; --red: #ff3860;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; height: 100vh; display: flex; background: var(--bg); color: var(--text);
+    font-family: 'SF Mono', 'Fira Code', Consolas, monospace; overflow: hidden;
+  }
+  #sidebar {
+    width: 260px; background: var(--panel); border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; padding: 16px; gap: 18px; flex-shrink: 0;
+  }
+  .brand { font-weight: 700; font-size: 15px; letter-spacing: 1px; }
+  .brand span { color: var(--green); text-shadow: 0 0 8px var(--green); }
+  .ver { color: var(--dim); font-size: 11px; }
+  .section-label { color: var(--dim); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
+  .mode-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .mode-btn {
+    background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+    padding: 8px 6px; border-radius: 6px; cursor: pointer; font-size: 12px; text-align: center;
+    transition: all .15s;
+  }
+  .mode-btn:hover { border-color: var(--cyan); }
+  .mode-btn.active { border-color: var(--green); color: var(--green); box-shadow: 0 0 10px rgba(57,255,20,.25); }
+  select, .ctrl-btn {
+    width: 100%; background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+    padding: 8px; border-radius: 6px; font-family: inherit; font-size: 12px; cursor: pointer;
+  }
+  .ctrl-btn:hover { border-color: var(--cyan); color: var(--cyan); }
+  .ctrl-row { display: flex; gap: 6px; }
+  .ctrl-row .ctrl-btn { flex: 1; }
+  #ctxwrap { margin-top: auto; }
+  #ctxbar-outer { width: 100%; height: 6px; background: var(--panel2); border-radius: 4px; overflow: hidden; }
+  #ctxbar-inner { height: 100%; width: 0%; background: var(--green); transition: width .3s; }
+  #ctxlabel { color: var(--dim); font-size: 11px; margin-top: 4px; }
+  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #chat { flex: 1; overflow-y: auto; padding: 24px 12%; display: flex; flex-direction: column; gap: 16px; }
+  .msg { max-width: 100%; padding: 12px 16px; border-radius: 10px; line-height: 1.55; font-size: 14px; white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user { align-self: flex-end; background: rgba(0,229,255,.08); border: 1px solid rgba(0,229,255,.3); }
+  .msg.assistant { align-self: flex-start; background: var(--panel2); border: 1px solid var(--border); }
+  .msg .role { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
+  .msg.user .role { color: var(--cyan); }
+  .msg.assistant .role { color: var(--green); }
+  .msg code, .msg pre { font-family: 'SF Mono', Consolas, monospace; }
+  .msg pre { background: #05050a; border: 1px solid var(--border); padding: 10px; border-radius: 6px; overflow-x: auto; margin: 8px 0; }
+  #inputbar { padding: 16px 12%; border-top: 1px solid var(--border); background: var(--panel); }
+  #inputrow { display: flex; gap: 10px; }
+  #msginput {
+    flex: 1; background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+    padding: 12px 14px; border-radius: 8px; font-family: inherit; font-size: 14px; resize: none; max-height: 160px;
+  }
+  #msginput:focus { outline: none; border-color: var(--green); }
+  #sendbtn {
+    background: var(--green); color: #04140a; border: none; padding: 0 22px; border-radius: 8px;
+    cursor: pointer; font-weight: 700; font-size: 13px;
+  }
+  #sendbtn:hover { filter: brightness(1.1); }
+  #sendbtn:disabled { background: var(--dim); cursor: default; }
+  .hint { color: var(--dim); font-size: 11px; margin-top: 6px; }
+  ::-webkit-scrollbar { width: 8px; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+</style>
+</head>
+<body>
+
+<div id="sidebar">
+  <div>
+    <div class="brand">CYBER <span>SH</span> DIRECT</div>
+    <div class="ver" id="verlabel">v__VERSION__ · GUI</div>
+  </div>
+
+  <div>
+    <div class="section-label">Mode</div>
+    <div class="mode-grid" id="modegrid"></div>
+  </div>
+
+  <div>
+    <div class="section-label">Model</div>
+    <select id="modelselect"></select>
+  </div>
+
+  <div>
+    <div class="section-label">Session</div>
+    <div class="ctrl-row">
+      <button class="ctrl-btn" id="btn-regen">↻ Regen</button>
+      <button class="ctrl-btn" id="btn-compact">🗜 Compact</button>
+    </div>
+    <div class="ctrl-row" style="margin-top:6px">
+      <button class="ctrl-btn" id="btn-export">📤 Export</button>
+      <button class="ctrl-btn" id="btn-clear">🗑 Clear</button>
+    </div>
+  </div>
+
+  <div id="ctxwrap">
+    <div class="section-label">Context window</div>
+    <div id="ctxbar-outer"><div id="ctxbar-inner"></div></div>
+    <div id="ctxlabel">0%</div>
+  </div>
+</div>
+
+<div id="main">
+  <div id="chat"></div>
+  <div id="inputbar">
+    <div id="inputrow">
+      <textarea id="msginput" rows="1" placeholder="Ask anything… (Enter to send, Shift+Enter for newline)"></textarea>
+      <button id="sendbtn">Send</button>
+    </div>
+    <div class="hint">Agent mode with tool execution + approval prompts is only available in the terminal (run without --gui, use /agent).</div>
+  </div>
+</div>
+
+<script>
+const MODES = ["chat","sec","code","vibe"];
+const MODE_ICON = {chat:"💬 Chat", sec:"🔐 Sec", code:"⚡ Code", vibe:"🎨 Vibe"};
+let currentMode = "chat";
+let sending = false;
+
+const chatEl = document.getElementById("chat");
+const inputEl = document.getElementById("msginput");
+const sendBtn = document.getElementById("sendbtn");
+const modeGrid = document.getElementById("modegrid");
+const modelSelect = document.getElementById("modelselect");
+
+function escapeHtml(s) {
+  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+function renderContent(text) {
+  // lightweight fenced-code-block rendering, everything else stays plain text
+  const parts = text.split(/```/);
+  let html = "";
+  parts.forEach((part, i) => {
+    if (i % 2 === 1) {
+      const lines = part.split("\\n");
+      const body = lines.slice(lines[0].trim() && !lines[0].includes(" ") ? 1 : 0).join("\\n") || part;
+      html += "<pre>" + escapeHtml(body) + "</pre>";
+    } else {
+      html += escapeHtml(part);
+    }
+  });
+  return html;
+}
+
+function addMessage(role, text) {
+  const div = document.createElement("div");
+  div.className = "msg " + role;
+  div.innerHTML = "<span class='role'>" + (role === "user" ? "You" : "AI") + "</span>" + renderContent(text);
+  chatEl.appendChild(div);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  return div;
+}
+
+function buildModeGrid() {
+  modeGrid.innerHTML = "";
+  MODES.forEach(m => {
+    const btn = document.createElement("div");
+    btn.className = "mode-btn" + (m === currentMode ? " active" : "");
+    btn.textContent = MODE_ICON[m];
+    btn.onclick = () => setMode(m);
+    modeGrid.appendChild(btn);
+  });
+}
+
+async function setMode(m) {
+  currentMode = m;
+  buildModeGrid();
+  await fetch("/api/mode", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({mode:m})});
+  chatEl.innerHTML = "";
+  refreshStatus();
+}
+
+async function refreshStatus() {
+  const r = await fetch("/api/status");
+  const s = await r.json();
+  document.getElementById("verlabel").textContent = "v" + s.version + " · GUI";
+  document.getElementById("ctxbar-inner").style.width = s.context_pct + "%";
+  document.getElementById("ctxbar-inner").style.background =
+    s.context_pct < 60 ? "var(--green)" : (s.context_pct < 85 ? "var(--yellow)" : "var(--red)");
+  document.getElementById("ctxlabel").textContent =
+    s.context_pct + "% · ~" + s.context_used.toLocaleString() + " / " + s.context_budget.toLocaleString() + " tok";
+}
+
+async function refreshModels() {
+  const r = await fetch("/api/models");
+  const d = await r.json();
+  modelSelect.innerHTML = "";
+  if (!d.models.length) {
+    const opt = document.createElement("option");
+    opt.textContent = "No models found in ~/ollama-models";
+    modelSelect.appendChild(opt);
+    return;
+  }
+  d.models.forEach(m => {
+    const opt = document.createElement("option");
+    opt.value = m; opt.textContent = m;
+    if (m === d.active) opt.selected = true;
+    modelSelect.appendChild(opt);
+  });
+}
+
+modelSelect.onchange = async () => {
+  await fetch("/api/model", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({target: modelSelect.value})});
+  refreshStatus();
+};
+
+async function streamRequest(path, body) {
+  sending = true; sendBtn.disabled = true; sendBtn.textContent = "…";
+  const aiDiv = addMessage("assistant", "");
+  const resp = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body || {})});
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let full = "";
+  while (true) {
+    const {done, value} = await reader.read();
+    if (done) break;
+    full += decoder.decode(value, {stream:true});
+    aiDiv.innerHTML = "<span class='role'>AI</span>" + renderContent(full);
+    chatEl.scrollTop = chatEl.scrollHeight;
+  }
+  sending = false; sendBtn.disabled = false; sendBtn.textContent = "Send";
+  refreshStatus();
+}
+
+async function sendMessage() {
+  const text = inputEl.value.trim();
+  if (!text || sending) return;
+  inputEl.value = ""; inputEl.style.height = "auto";
+  addMessage("user", text);
+  await streamRequest("/api/chat", {message: text});
+}
+
+sendBtn.onclick = sendMessage;
+inputEl.addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
+inputEl.addEventListener("input", () => {
+  inputEl.style.height = "auto";
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 160) + "px";
+});
+
+document.getElementById("btn-regen").onclick = async () => {
+  if (sending) return;
+  await streamRequest("/api/regen", {});
+};
+document.getElementById("btn-compact").onclick = async () => {
+  await fetch("/api/compact", {method:"POST"});
+  refreshStatus();
+  addMessage("assistant", "[history compacted — older messages summarized]");
+};
+document.getElementById("btn-clear").onclick = async () => {
+  await fetch("/api/clear", {method:"POST"});
+  chatEl.innerHTML = "";
+  refreshStatus();
+};
+document.getElementById("btn-export").onclick = async () => {
+  const r = await fetch("/api/export", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({format:"md"})});
+  const d = await r.json();
+  addMessage("assistant", "[exported to " + (d.path || "file") + "]");
+};
+
+buildModeGrid();
+refreshStatus();
+refreshModels();
+inputEl.focus();
+</script>
+</body>
+</html>
+"""
+
+_GUI_STATE = {}
+_GUI_LOCK  = threading.Lock()
+
+def _gui_reset_messages(cfg: dict, clear_session: bool = False) -> None:
+    mode = MODES.get(cfg.get("mode", "chat"), MODES["chat"])
+    _GUI_STATE["messages"] = [{"role": "system", "content": mode["system"] + "\n\n" + get_env_context()}]
+    if clear_session:
+        _GUI_STATE["session_msgs"] = []
+
+def _gui_status() -> dict:
+    cfg, messages = _GUI_STATE["cfg"], _GUI_STATE["messages"]
+    budget = cfg.get("context", 4096)
+    used   = _messages_token_estimate(messages)
+    pct    = min(100, int(used / budget * 100)) if budget else 0
+    return {
+        "version": APP_VERSION, "mode": cfg.get("mode", "chat"),
+        "model": os.path.basename(cfg.get("model_path", "")),
+        "context_pct": pct, "context_used": used, "context_budget": budget,
+    }
+
+def _gui_list_models() -> dict:
+    models_dir = os.path.expanduser("~/ollama-models")
+    found = []
+    if os.path.isdir(models_dir):
+        found = sorted(f for f in os.listdir(models_dir) if f.lower().endswith(".gguf"))
+    return {"models": found, "active": os.path.basename(_GUI_STATE["cfg"].get("model_path", ""))}
+
+def _send_chunk(wfile, text: str) -> None:
+    data = text.encode("utf-8")
+    wfile.write(f"{len(data):X}\r\n".encode())
+    wfile.write(data)
+    wfile.write(b"\r\n")
+    wfile.flush()
+
+def _end_chunks(wfile) -> None:
+    wfile.write(b"0\r\n\r\n")
+    wfile.flush()
+
+class _GUIHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        pass  # keep the terminal clean — GUI has its own status area
+
+    def _json(self, obj: dict, status: int = 200) -> None:
+        body = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path in ("/", ""):
+            body = GUI_HTML.replace("__VERSION__", APP_VERSION).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/api/status":
+            self._json(_gui_status())
+        elif self.path == "/api/models":
+            self._json(_gui_list_models())
+        else:
+            self._json({"error": "not found"}, 404)
+
+    def do_POST(self):
+        length  = int(self.headers.get("Content-Length", 0) or 0)
+        raw     = self.rfile.read(length) if length else b"{}"
+        try:
+            payload = json.loads(raw or b"{}")
+        except Exception:
+            payload = {}
+
+        cfg = _GUI_STATE["cfg"]
+
+        if self.path == "/api/chat":
+            self._stream_chat(payload.get("message", ""))
+        elif self.path == "/api/regen":
+            self._stream_chat(None, regen=True)
+        elif self.path == "/api/mode":
+            if payload.get("mode") in MODES:
+                cfg["mode"] = payload["mode"]
+                _gui_reset_messages(cfg)
+            self._json({"ok": True})
+        elif self.path == "/api/model":
+            cmd_model_switch(payload.get("target", ""), cfg)
+            self._json({"ok": True})
+        elif self.path == "/api/compact":
+            with _GUI_LOCK:
+                cmd_compact(cfg, _GUI_STATE["messages"])
+            self._json({"ok": True})
+        elif self.path == "/api/clear":
+            with _GUI_LOCK:
+                _gui_reset_messages(cfg, clear_session=True)
+            self._json({"ok": True})
+        elif self.path == "/api/export":
+            with _GUI_LOCK:
+                dest = _gui_export(payload.get("format", "md"))
+            self._json({"ok": True, "path": dest})
+        else:
+            self._json({"error": "not found"}, 404)
+
+    def _stream_chat(self, user_text, regen: bool = False) -> None:
+        cfg, messages, session_msgs = _GUI_STATE["cfg"], _GUI_STATE["messages"], _GUI_STATE["session_msgs"]
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+
+        with _GUI_LOCK:
+            if regen:
+                if len(messages) < 2 or messages[-1]["role"] != "assistant":
+                    _send_chunk(self.wfile, "[nothing to regenerate yet]")
+                    _end_chunks(self.wfile)
+                    return
+                messages.pop()
+                if session_msgs and session_msgs[-1]["role"] == "assistant":
+                    session_msgs.pop()
+            else:
+                messages.append({"role": "user", "content": user_text})
+                session_msgs.append({"role": "user", "content": user_text})
+            manage_context(cfg, messages)
+
+            full = []
+            try:
+                for token in stream_local(cfg, messages):
+                    full.append(token)
+                    _send_chunk(self.wfile, token)
+            except Exception as e:
+                _send_chunk(self.wfile, f"\n[error: {e}]")
+            response = "".join(full)
+            if response:
+                messages.append({"role": "assistant", "content": response})
+                session_msgs.append({"role": "assistant", "content": response})
+                save_history(cfg["history_file"], session_msgs, cfg["max_history"])
+        _end_chunks(self.wfile)
+
+def _gui_export(fmt: str) -> str:
+    """Same export logic as /export in the terminal, callable from the GUI."""
+    session_msgs = _GUI_STATE["session_msgs"]
+    if not session_msgs:
+        return ""
+    fmt  = "html" if fmt.lower() == "html" else "md"
+    ts   = time.strftime("%Y%m%d_%H%M%S")
+    dest = os.path.join(os.getcwd(), f"cybersh_export_{ts}.{fmt}")
+    if fmt == "md":
+        parts = [f"# CyberSH conversation — {time.strftime('%Y-%m-%d %H:%M')}\n"]
+        for m in session_msgs:
+            if m["role"] == "system": continue
+            who = "You" if m["role"] == "user" else "AI"
+            parts.append(f"**{who}:**\n\n{m['content']}\n")
+        content = "\n---\n\n".join(parts)
+    else:
+        import html as _html
+        rows = []
+        for m in session_msgs:
+            if m["role"] == "system": continue
+            who = "You" if m["role"] == "user" else "AI"
+            rows.append(f"<div class='msg {m['role']}'><b>{who}:</b><pre>{_html.escape(m['content'])}</pre></div>")
+        content = ("<html><head><meta charset='utf-8'></head><body>"
+                   f"<h1>CyberSH conversation</h1>" + "".join(rows) + "</body></html>")
+    with open(dest, "w", encoding="utf-8") as f:
+        f.write(content)
+    return dest
+
+def launch_gui(cfg: dict, port: int = 8420) -> None:
+    """Serve a browser-based GUI for cybersh — same local model, same
+    context management, no cloud, no extra dependencies (stdlib http.server
+    only). Chat/Sec/Code/Vibe modes are supported; Agent mode's tool
+    execution + approval flow is terminal-only by design, since it needs a
+    real confirm prompt before running destructive actions."""
+    import webbrowser
+
+    get_llm(cfg)  # load the model up front so the first chat isn't slow
+    mode = MODES.get(cfg.get("mode", "chat"), MODES["chat"])
+    _GUI_STATE["cfg"]          = cfg
+    _GUI_STATE["messages"]     = [{"role": "system", "content": mode["system"] + "\n\n" + get_env_context()}]
+    _GUI_STATE["session_msgs"] = []
+
+    class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+    url = f"http://127.0.0.1:{port}"
+    try:
+        httpd = _Server(("127.0.0.1", port), _GUIHandler)
+    except OSError as e:
+        print(f"\n{NEON_R}✗ Could not start GUI on port {port}: {e}{R}")
+        print(f"{NEON_Y}Try a different port: --gui --port 8421{R}\n")
+        return
+
+    print(f"\n{NEON_G}✓ GUI running at {NEON_C}{url}{R}")
+    print(f"{DIM}  Ctrl+C to stop.{R}\n")
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print(f"\n{NEON_Y}Shutting down GUI…{R}")
+        httpd.shutdown()
+
 
 # ══════════════════════════════════════════════════════════════
 #  REPL
@@ -5179,6 +5936,16 @@ def repl(cfg: dict, one_shot: str | None = None) -> None:
         elif cmd == "/temp":
             try: cfg["temperature"] = float(arg); print(f"{NEON_G}✓ Temp → {arg}{R}\n")
             except: print(f"{NEON_Y}Usage: /temp <0.0-2.0>{R}\n")
+        elif cmd == "/context":
+            cmd_context_status(cfg, messages)
+        elif cmd == "/regen":
+            last_response = cmd_regenerate(cfg, messages, session_msgs)
+        elif cmd == "/model":
+            cmd_model_switch(arg, cfg)
+        elif cmd == "/compact":
+            cmd_compact(cfg, messages)
+        elif cmd == "/export":
+            cmd_export(arg, session_msgs)
         elif cmd == "/info":
             mp = cfg.get("model_path","none")
             sz = f"{os.path.getsize(mp)/1e9:.1f} GB" if os.path.exists(mp) else "?"
@@ -5431,11 +6198,16 @@ def repl(cfg: dict, one_shot: str | None = None) -> None:
                 os.makedirs(dl_dir, exist_ok=True)
                 dest   = os.path.join(dl_dir, model["file"])
                 print(f"\n{NEON_C}Downloading {model['file']}…{R}")
-                ret = os.system(f'wget -c -O "{dest}" "{model["url"]}"')
-                if ret == 0 and os.path.exists(dest):
+                ok = _download_file(model["url"], dest, label=model["file"])
+                if ok:
+                    ok = _verify_model_sha256(dest, KNOWN_MODEL_SHA256.get(choice), model["file"])
+                if ok and os.path.exists(dest):
                     cfg["model_path"] = dest
                     save_cfg(cfg)
-                    print(f"\n{NEON_G}✓ Downloaded! Restart to use new model.{R}\n")
+                    global _llm_instance
+                    _llm_instance = None
+                    get_llm(cfg)
+                    print(f"\n{NEON_G}✓ Downloaded and loaded — ready to use now.{R}\n")
                 else:
                     print(f"{NEON_R}✗ Download failed.{R}\n")
         elif cmd == "/plugins":
@@ -5472,6 +6244,8 @@ def main() -> None:
     parser.add_argument("--ctx",         type=int)
     parser.add_argument("--threads",     type=int)
     parser.add_argument("--setup",       action="store_true", help="Run setup wizard")
+    parser.add_argument("--gui",         action="store_true", help="Launch the browser-based GUI instead of the terminal REPL")
+    parser.add_argument("--port",        type=int, default=8420, help="Port for --gui (default 8420)")
     parser.add_argument("--update",      action="store_true", help="Force update from GitHub")
     parser.add_argument("--no-update",   action="store_true", help="Skip update check")
     parser.add_argument("--version",     action="version", version=f"CYBER SH DIRECT v{APP_VERSION}")
@@ -5521,6 +6295,10 @@ def main() -> None:
         if args.output and response:
             with open(os.path.expanduser(args.output),"w") as f: f.write(response)
             print(f"{NEON_G}✓ Saved → {args.output}{R}")
+        return
+
+    if args.gui:
+        launch_gui(cfg, port=args.port)
         return
 
     repl(cfg)
