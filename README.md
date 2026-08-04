@@ -12,13 +12,60 @@
 **CYBER SH — Your Personal Offline AI Assistant**  
 Runs entirely on your own computer. No cloud. No subscriptions. No one watching.
 
-![Version](https://img.shields.io/badge/version-1.7-brightgreen)
+![Version](https://img.shields.io/badge/version-1.8-brightgreen)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-orange)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)
 ![Security](https://img.shields.io/badge/security-audited%20v1.4-blue)
 
 </div>
+
+---
+
+## 🆕 v1.8 — Context Safety, Model Switching & Regenerate
+
+### 🛡️ Automatic context management
+
+The #1 way local llama.cpp chat sessions crash is a long conversation silently overflowing the model's context window (`Requested tokens exceed context window`). v1.8 tracks a running token estimate for the live conversation and, once it gets close to the budget, automatically drops the oldest turns (keeping the system prompt and your most recent exchanges) instead of hitting that wall. This applies in both normal chat and the agent tool-calling loop, which is the fastest way to burn through context. Toggle with `auto_trim_context` in your config; check current usage anytime with `/context`.
+
+### 🔁 `/model` — hot-swap models without restarting
+
+List every `.gguf` in `~/ollama-models` and switch the active chat model on the fly:
+
+```
+/model                  → list available models, shows which is active
+/model 2                → switch to the 2nd model in the list
+/model qwen             → switch by (partial) filename match
+/model ~/path/to.gguf   → switch to any file path
+```
+
+`/models` (download new models) now also loads the model immediately after downloading instead of telling you to restart.
+
+### ↻ `/regen` — redo the last response
+
+Didn't like the last answer? `/regen` drops it and asks again with the same context — standard in every other chat tool, now here too.
+
+### 🗜️ `/compact` — smart context compaction
+
+Rather than just dropping old turns, `/compact` has the AI summarize everything except your most recent exchange into a short briefing, then replaces the old history with that summary — same idea as Claude Code's `/compact`. Frees up real context budget without losing the thread of the conversation.
+
+### 📤 `/export` — save the conversation to a file
+
+```
+/export        → Markdown file in the current directory
+/export html   → styled HTML file instead
+```
+
+### 🖥️ Browser-based GUI
+
+A real GUI, no extra dependencies — stdlib `http.server` only, runs entirely on `127.0.0.1`, no cloud involved:
+
+```
+python cybersh_direct.py --gui
+python cybersh_direct.py --gui --port 8421   # if 8420 is taken
+```
+
+Opens automatically in your browser: mode switcher (Chat/Sec/Code/Vibe), a model dropdown that hot-swaps via `/model` under the hood, live streaming responses, context-usage bar, and one-click Regen/Compact/Export/Clear. Agent mode's tool execution + approval prompts are terminal-only by design — a real confirm dialog before destructive actions matters more than convenience there, so run the plain REPL and use `/agent` for that.
 
 ---
 
@@ -45,6 +92,10 @@ The `/code` system prompt was rewritten to think like a principal engineer: it d
 /testgen src/parser.py
 /complexity ~/scripts/scraper.py
 ```
+
+### 🪟 Native Windows fixes
+
+Downloads (`/models`, `--setup`, `/see setup`) previously shelled out to `wget`, which isn't installed by default on Windows — this silently broke model downloads on a stock Windows machine. v1.7 replaces it with a pure-Python downloader (stdlib `urllib`, works identically everywhere) and wires in the SHA-256 verification that already existed but was never actually being called. ANSI colors are now explicitly enabled on `cmd.exe` via the Windows console API, so you get real colors instead of raw escape codes on terminals that don't already support VT100.
 
 ---
 
@@ -80,10 +131,6 @@ Drop a `.py` file in `~/.cybersh_plugins/` (or `./cybersh_plugins/` next to the 
 ### 📖 Rebuilt `/help`
 
 Searchable, categorized help — `/help rag`, `/help code`, etc. — instead of one long wall of text.
-
-### 🪟 Full Windows compatibility
-
-Native `cmd.exe` support: ANSI colors work out of the box, a pure-Python downloader replaces the old `wget` dependency, and pip flag handling is cross-platform. Windows no longer requires WSL2 (though it's still supported).
 
 ---
 
@@ -320,7 +367,7 @@ You can download and switch models anytime inside the app with `/models`.
 
 **macOS** — works natively
 
-**Windows** — native support since v1.6 (ANSI colors in `cmd.exe`, pure-Python downloader, cross-platform pip flags):
+**Windows** — native support since v1.7 (ANSI colors enabled on `cmd.exe`, pure-Python downloader instead of `wget`, cross-platform pip flags):
 ```powershell
 python cybersh_direct.py --setup
 ```
@@ -567,8 +614,9 @@ Plugins are plain `.py` files in `~/.cybersh_plugins/` (or `./cybersh_plugins/`)
 
 | Version | What was added |
 |---------|---------------|
-| **v1.7** | **Direct-to-gguf prompt caching** — in-RAM `LlamaCache` attached straight to the loaded chat/embedder/vision models, so repeated or shared-prefix prompts skip re-evaluation · RAG index now cached in RAM instead of re-read from disk every call · rewritten `/code` system prompt (full files, edge cases, security/perf called out unprompted) · `/review` `/debug` `/testgen` `/docstring` `/complexity` now accept a file path directly |
-| **v1.6** | **Agent tool-calling loop** — real `ACTION:` execution with approval gating for destructive steps · **`/see`** local vision (LLaVA/Phi-3 multimodal) · **`/rag`** local offline retrieval over your own files · plugin system with hot-reload (`/plugins`) · rebuilt searchable `/help` · full native Windows support (no WSL2 required) · `/testgen` `/docstring` `/complexity` `/gitdiff` `/commitmsg` `/todo` `/gitignore` `/license` `/lint` `/profile` |
+| **v1.8** | **Automatic context management** — auto-trims oldest turns once the conversation nears the model's context budget instead of crashing with a hard overflow error, in both chat and the agent loop · **`/model`** — list and hot-swap the loaded `.gguf` model without restarting · **`/regen`** — redo the last response · **`/context`** — see current context-window usage · **`/compact`** — AI-summarizes older history instead of just dropping it · **`/export [html]`** — save the conversation to a Markdown or HTML file · **`--gui`** — browser-based GUI (stdlib only, no extra deps) with mode switching, model dropdown, streaming, and one-click Regen/Compact/Export/Clear · `/models` now loads a freshly downloaded model immediately instead of requiring a restart |
+| **v1.7** | **Direct-to-gguf prompt caching** — in-RAM `LlamaCache` attached straight to the loaded chat/embedder/vision models, so repeated or shared-prefix prompts skip re-evaluation · RAG index now cached in RAM instead of re-read from disk every call · rewritten `/code` system prompt (full files, edge cases, security/perf called out unprompted) · `/review` `/debug` `/testgen` `/docstring` `/complexity` now accept a file path directly · **native Windows fixes** — pure-Python downloader replaces the `wget` dependency, SHA-256 model verification actually wired in, ANSI colors enabled on `cmd.exe` |
+| **v1.6** | **Agent tool-calling loop** — real `ACTION:` execution with approval gating for destructive steps · **`/see`** local vision (LLaVA/Phi-3 multimodal) · **`/rag`** local offline retrieval over your own files · plugin system with hot-reload (`/plugins`) · rebuilt searchable `/help` · `/testgen` `/docstring` `/complexity` `/gitdiff` `/commitmsg` `/todo` `/gitignore` `/license` `/lint` `/profile` |
 | **v1.5** | **`/image`** — local Stable Diffusion image generation, saves `.png` next to script, auto GPU/CPU, supports `--steps`, `--size`, `--model`, `--neg` · **`/fetch`** — persistent web agent with TinyDB storage, auto-injects saved site content into AI context · **`/fetchauth`** — cookie / bearer / basic auth for saved sites · **`/fetchsites`** / **`/fetchforget`** — manage saved sites |
 | **v1.4** | **Security release** — TLS certificate verification restored · auto-updater SHA-256 checksum verification against published manifest · atomic update writes (crash-safe) · memory plain-text storage warning · obfuscated `chr()` code removed · downloaded model SHA-256 verification |
 | **v1.3** | OS-aware AI responses · loop/repetition auto-detection · entropy-based password checks · clipboard auto-detection (Wayland/X11/macOS/WSL) · rewritten `/headers` with severity tags · sessions system · `/convert` `/qr` `/speedtest` `/pwcheck` `/debug` `/review` `/template` `/gitlog` `/hash` `/osint` `/wordlist` `/think` `/debate` `/improve` `/eli5` `/ipinfo` `/base` `/clock` `/lorem` `/gist` |
