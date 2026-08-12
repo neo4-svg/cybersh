@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# version: 1.8
+# version: 1.9
 """
  ██████╗██╗   ██╗██████╗ ███████╗██████╗     ███████╗██╗  ██╗
 ██╔════╝╚██╗ ██╔╝██╔══██╗██╔════╝██╔══██╗    ██╔════╝██║  ██║
@@ -10,7 +10,7 @@
   CYBER SH DIRECT — No Server · Pure Python · llama-cpp-python
 """
 
-import sys, os, json, time, shutil, re, subprocess, threading, datetime, textwrap, argparse, glob, readline
+import sys, os, json, time, shutil, re, subprocess, threading, datetime, textwrap, argparse, glob, readline, difflib
 import importlib.util
 import http.server, socketserver
 
@@ -407,7 +407,7 @@ ALL_COMMANDS = [
     "/testgen","/docstring","/complexity","/gitdiff","/commitmsg",
     "/todo","/gitignore","/license","/lint","/profile",
     "/plugins",
-    "/model","/context","/regen","/compact","/export",
+    "/model","/context","/regen","/compact","/export","/undo",
     "--update","--no-update",
 ]
 
@@ -697,7 +697,7 @@ DEFAULT_CFG = {
     "history_file":   os.path.expanduser("~/.cybersh_direct_history.json"),
     "max_history":    60,
     "threads":        4,
-    "max_agent_iters": 6,      # auto tool round-trips per turn
+    "max_agent_iters": 12,     # auto tool round-trips per turn (coding tasks need many steps)
     "vision_model_path": "",   # multimodal .gguf (e.g. moondream2)
     "vision_mmproj_path": "",  # matching --mmproj clip projector file
     "rag_enabled":    True,    # allow /rag commands to build a local index
@@ -1163,9 +1163,31 @@ def rag_search(query: str, cfg: dict, top_k: int = 4) -> list:
 # ══════════════════════════════════════════════════════════════
 _ENV_CACHE = None
 
+def get_project_context() -> str:
+    """Read an optional CYBERSH.md (or .cybersh.md) in the current directory
+    and feed it into the system prompt — same idea as Claude Code's
+    CLAUDE.md: a place for project-specific conventions, build/test commands,
+    and context the AI should always have for this project."""
+    for name in ("CYBERSH.md", ".cybersh.md"):
+        path = os.path.join(os.getcwd(), name)
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", errors="ignore") as f:
+                    content = f.read(8000)
+                if content.strip():
+                    return f"\n\n[PROJECT CONTEXT from {name} — follow these project-specific " \
+                           f"conventions and instructions:]\n{content.strip()}"
+            except Exception:
+                pass
+    return ""
+
 def get_env_context() -> str:
     """Build a short OS/environment description for the AI system prompt.
-    Cached after first call since OS doesn't change mid-session."""
+    Cached after first call since OS and cwd don't change mid-session.
+    Deliberately includes the exact python binary, shell, cwd, and git
+    status — these are the concrete facts that stop the model from
+    guessing wrong (e.g. running `python` on a system that only has
+    `python3`) instead of just naming the OS."""
     global _ENV_CACHE
     if _ENV_CACHE:
         return _ENV_CACHE
@@ -1184,12 +1206,38 @@ def get_env_context() -> str:
     }
     pkg_line = pkg_examples.get(pkg_mgr, "")
 
+    # which python command actually exists — the #1 avoidable "command not
+    # found" error is assuming `python` when only `python3` is installed
+    py_cmd = "python3" if shutil.which("python3") else ("python" if shutil.which("python") else None)
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    pip_flag = " --break-system-packages" if os_info.get("pip_flag") else ""
+
+    shell_name = os.path.basename(os.environ.get("SHELL", "")) or ("cmd.exe" if os.name == "nt" else "unknown")
+
+    cwd = os.getcwd()
+    in_git = os.path.isdir(os.path.join(cwd, ".git")) or shutil.which("git") and subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"], cwd=cwd,
+        capture_output=True, text=True, timeout=3
+    ).stdout.strip() == "true"
+
+    facts = [f"OS: {distro}", f"Shell: {shell_name}", f"CWD: {cwd}"]
+    if py_cmd:
+        facts.append(f"Python: run it as `{py_cmd}` (v{py_ver}) — do NOT assume `python` exists, use `{py_cmd}` explicitly")
+    else:
+        facts.append("Python: no python interpreter found on PATH — flag this instead of assuming one exists")
+    if pkg_mgr:
+        facts.append(f"Package manager: {pkg_mgr} — use '{pkg_line}'{(' with ' + pip_flag.strip()) if pip_flag else ''}, never suggest a different one")
+    facts.append(f"Git repo: {'yes' if in_git else 'no'} — " + ("git commands are safe to use here" if in_git
+                 else "this directory is NOT a git repo, don't assume git history/branches exist"))
+
     _ENV_CACHE = (
-        f"[SYSTEM ENVIRONMENT: The user is running {distro}. "
-        + (f"Their package manager is {pkg_mgr} — use '{pkg_line}' for install commands, "
-           f"NEVER suggest a different package manager. " if pkg_mgr else "")
-        + "Always tailor shell commands, package install instructions, and file paths "
-        + "to THIS exact OS. Do not assume Ubuntu/apt unless that is what was detected.]"
+        "[SYSTEM ENVIRONMENT — concrete facts about THIS machine, use them exactly, "
+        "don't guess or assume a different setup:]\n- " + "\n- ".join(facts) + "\n"
+        "Always tailor shell commands, package install instructions, and file paths to "
+        "these exact facts. If a command you'd normally reach for isn't confirmed above "
+        "(e.g. a specific tool's presence), check with `which <tool>` before relying on it "
+        "instead of assuming it's installed."
+        + get_project_context()
     )
     return _ENV_CACHE
 
@@ -1254,25 +1302,60 @@ MODES = {
     "agent": {
         "icon": "🤖", "label": "AGENT", "color": NEON_O,
         "system": (
-            "You are CYBER SH AGENT controlling a Linux computer. "
+            "You are CYBER SH AGENT — an autonomous coding agent controlling a Linux computer, "
+            "operating the way a careful senior engineer would. "
             "When asked to do things, use ACTION BLOCKS — one per line:\n"
             "ACTION: run_command | <bash command>\n"
             "ACTION: create_file | <filepath> | <content>\n"
             "ACTION: edit_file | <filepath> | <old text> | <new text>\n"
             "ACTION: delete_file | <filepath>\n"
             "ACTION: open_app | <app>\n"
-            "ACTION: search_files | <pattern>\n"
+            "ACTION: search_files | <glob pattern>   (find files by name)\n"
+            "ACTION: grep_files | <regex> | <path>    (search file CONTENTS — use this to find where "
+            "something is defined/used before touching it)\n"
+            "ACTION: list_dir | <path>                (see the project structure before editing blind)\n"
             "ACTION: read_file | <filepath>\n"
             "ACTION: make_dir | <path>\n"
             "ACTION: web_search | <query>\n"
             "ACTION: rag_search | <query>   (searches the user's indexed local knowledge base)\n"
-            "Always explain what you're doing before each ACTION. "
+            "\n"
+            "How to work on a coding task, in order:\n"
+            "1) ORIENT before you touch anything — use list_dir and grep_files to understand the "
+            "project's structure and conventions. Don't guess at file layout or existing code.\n"
+            "2) READ before you EDIT — always read_file the exact section you're about to change so "
+            "your old-text match is byte-accurate. Never edit a file you haven't read this turn.\n"
+            "3) PREFER edit_file over create_file for existing files — small, targeted, reviewable "
+            "changes over full-file rewrites. Only use create_file for genuinely new files. If "
+            "edit_file reports the match isn't unique, include more surrounding context and retry.\n"
+            "4) VERIFY your own work — after a code change, run_command the relevant test suite, "
+            "linter, or a quick syntax/import check (e.g. `python -m py_compile file.py`). If it "
+            "fails, read the error, fix it, and re-run. Don't declare a task done on faith.\n"
+            "5) MATCH the existing style — same indentation, naming, and patterns already used in "
+            "the file, not your own preferences.\n"
+            "6) WORK AUTONOMOUSLY through the whole task — chain as many ACTIONs as the task needs "
+            "across your available turns without stopping to ask 'should I continue?' Only pause "
+            "for the user's approval prompt (which happens automatically on side-effecting actions) "
+            "or if the task is genuinely ambiguous about WHAT to build, not HOW.\n"
+            "7) DO EXACTLY WHAT WAS ASKED — no more, no less. Don't add extra features, files, "
+            "refactors, or 'improvements' the user didn't request. If the request is genuinely "
+            "ambiguous about what to build, ask one short clarifying question before acting; if "
+            "it's just ambiguous about HOW, pick the most reasonable approach and proceed.\n"
+            "8) USE the [SYSTEM ENVIRONMENT] facts below exactly as given — the correct python "
+            "command, package manager, shell, and cwd are already detected for you. Don't guess "
+            "or assume a different setup. If you need to know whether a specific tool is installed "
+            "beyond what's listed, check with `which <tool>` via run_command before relying on it.\n"
+            "9) WHEN AN ACTION FAILS, read the actual error text in the tool result and fix the "
+            "real cause — wrong path, wrong command name, missing flag, etc. Never re-run the exact "
+            "same action expecting a different result; that wastes a turn and won't self-correct.\n"
+            "\n"
+            "Always explain what you're doing before each ACTION, briefly. "
             "Destructive/side-effecting actions (run_command, create_file, edit_file, delete_file, "
             "open_app, make_dir) require the user's approval each time. Read-only actions "
-            "(search_files, read_file, web_search, rag_search) run immediately and their output "
-            "is fed straight back to you automatically — you do NOT need the user to repeat "
-            "themselves. Use that output to decide your next ACTION or give a final answer. "
-            "Once you have enough information, stop issuing ACTIONs and give a normal final answer."
+            "(search_files, grep_files, list_dir, read_file, web_search, rag_search) run immediately "
+            "and their output is fed straight back to you automatically — you do NOT need the user "
+            "to repeat themselves. Use that output to decide your next ACTION or give a final answer. "
+            "Once the task is actually done and verified, stop issuing ACTIONs and give a final "
+            "summary of what changed and how you confirmed it works."
         ) + _GLOBAL_RULES,
     },
 }
@@ -1576,13 +1659,72 @@ def stream_local(cfg: dict, messages: list):
 # TOOLS registry: single source of truth for what the agent can call.
 # "confirm": True  -> user must approve (destructive / side-effecting)
 # "confirm": False -> read-only, runs immediately and result is fed straight back
+_IGNORE_DIRS = {".git", "node_modules", "__pycache__", "venv", ".venv", "env",
+                 "dist", "build", ".idea", ".vscode", "target", ".mypy_cache", ".pytest_cache"}
+
+def _grep_files(pattern: str, root: str, max_results: int = 50) -> str:
+    """Content search across a directory tree — the tool that lets the agent
+    find where something is actually used/defined, instead of guessing from
+    filenames alone."""
+    try:
+        regex = re.compile(pattern)
+    except re.error as e:
+        return f"⚠ Invalid regex: {e}"
+    root = os.path.expanduser(root or ".")
+    hits = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _IGNORE_DIRS and not d.startswith(".")]
+        for fn in sorted(filenames):
+            if len(hits) >= max_results:
+                return "\n".join(hits) + f"\n… ({max_results}+ matches, narrow your pattern)"
+            fpath = os.path.join(dirpath, fn)
+            try:
+                if os.path.getsize(fpath) > 1_000_000:
+                    continue
+                with open(fpath, "r", errors="ignore") as f:
+                    for i, line in enumerate(f, 1):
+                        if regex.search(line):
+                            hits.append(f"{fpath}:{i}: {line.strip()[:150]}")
+                            if len(hits) >= max_results:
+                                break
+            except Exception:
+                continue
+    return "\n".join(hits) if hits else "No matches."
+
+def _list_dir(path: str, max_depth: int = 3, max_entries: int = 200) -> str:
+    """Directory tree listing — how the agent orients itself in an unfamiliar
+    project before making changes, instead of editing blind."""
+    root = os.path.expanduser(path or ".")
+    if not os.path.isdir(root):
+        return f"⚠ Not a directory: {root}"
+    lines, root_depth = [], root.rstrip(os.sep).count(os.sep)
+    for dirpath, dirnames, filenames in os.walk(root):
+        depth = dirpath.rstrip(os.sep).count(os.sep) - root_depth
+        if depth >= max_depth:
+            dirnames[:] = []
+            continue
+        dirnames[:] = sorted(d for d in dirnames if d not in _IGNORE_DIRS and not d.startswith("."))
+        indent = "  " * depth
+        if dirpath != root:
+            lines.append(f"{indent}{os.path.basename(dirpath)}/")
+        for fn in sorted(filenames):
+            if fn.startswith("."):
+                continue
+            lines.append(f"{indent}  {fn}")
+            if len(lines) >= max_entries:
+                lines.append("… (truncated)")
+                return "\n".join(lines)
+    return "\n".join(lines) if lines else "(empty)"
+
 TOOLS = {
     "run_command":  {"confirm": True,  "danger": True,  "desc": "Run a shell command"},
     "create_file":  {"confirm": True,  "danger": False, "desc": "Create/overwrite a file"},
     "edit_file":    {"confirm": True,  "danger": False, "desc": "Find/replace text in a file"},
     "delete_file":  {"confirm": True,  "danger": True,  "desc": "Delete a file"},
     "open_app":     {"confirm": True,  "danger": False, "desc": "Launch an application"},
-    "search_files": {"confirm": False, "danger": False, "desc": "Glob-search for files"},
+    "search_files": {"confirm": False, "danger": False, "desc": "Glob-search for files by name"},
+    "grep_files":   {"confirm": False, "danger": False, "desc": "Search file contents for a pattern"},
+    "list_dir":     {"confirm": False, "danger": False, "desc": "List a directory tree"},
     "read_file":    {"confirm": False, "danger": False, "desc": "Read a file's contents"},
     "make_dir":     {"confirm": True,  "danger": False, "desc": "Create a directory"},
     "web_search":   {"confirm": False, "danger": False, "desc": "Search the web"},
@@ -1629,14 +1771,131 @@ def confirm_action(atype: str, parts: list) -> bool:
     }
     color, label, desc = labels.get(atype, (NEON_C, "ACTION", parts[0]))
     print(f"  {color}{BOLD}[{label}]{R}  {desc}")
+
     if atype == "delete_file":
-        print(f"  {NEON_R}{BOLD}⚠  PERMANENT DELETE{R}")
-    if atype == "create_file" and len(parts) > 1:
-        print(f"  {DIM}Preview: {parts[1][:80]}…{R}")
+        print(f"  {NEON_R}{BOLD}⚠  PERMANENT DELETE{R}  {DIM}(a backup is kept — /undo can restore it){R}")
+
+    elif atype == "create_file" and len(parts) > 1:
+        exists = os.path.isfile(os.path.expanduser(parts[0]))
+        if exists:
+            print(f"  {NEON_Y}⚠ File already exists — this will overwrite it (backup kept, /undo can restore).{R}")
+        preview = parts[1][:400]
+        print(f"  {DIM}{'─'*min(c,50)}{R}")
+        for line in preview.split("\n")[:15]:
+            print(f"  {NEON_G}+ {line}{R}")
+        if len(parts[1]) > 400 or len(parts[1].split(chr(10))) > 15:
+            print(f"  {DIM}  … ({len(parts[1])} chars total){R}")
+
+    elif atype == "edit_file" and len(parts) > 2:
+        path, old, new = parts[0], parts[1], parts[2]
+        full_path = os.path.expanduser(path)
+        diff_lines = list(difflib.unified_diff(
+            old.splitlines(keepends=True), new.splitlines(keepends=True),
+            lineterm="", n=1
+        ))
+        print(f"  {DIM}{'─'*min(c,50)}{R}")
+        if diff_lines:
+            for line in diff_lines[2:22]:  # skip the --- / +++ header lines
+                if line.startswith("+"):
+                    print(f"  {NEON_G}{line}{R}")
+                elif line.startswith("-"):
+                    print(f"  {NEON_R}{line}{R}")
+                elif line.startswith("@@"):
+                    print(f"  {NEON_C}{line}{R}")
+                else:
+                    print(f"  {DIM}{line}{R}")
+        else:
+            print(f"  {DIM}(no visible diff — check whitespace){R}")
+
     sys.stdout.write(f"\n  {NEON_Y}Approve? [y/N]: {R}")
     try: ans = input().strip().lower()
     except: ans = "n"
     return ans in ("y","yes")
+
+def _agent_backup_dir() -> str:
+    d = os.path.expanduser("~/.cybersh_backups")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def _agent_backup_log_path() -> str:
+    return os.path.join(_agent_backup_dir(), "log.json")
+
+def _agent_backup_log_load() -> list:
+    p = _agent_backup_log_path()
+    if not os.path.isfile(p):
+        return []
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def _agent_backup_log_save(log: list) -> None:
+    with open(_agent_backup_log_path(), "w") as f:
+        json.dump(log[-50:], f)  # cap history so this can't grow forever
+
+def _agent_snapshot(path: str, action: str) -> None:
+    """Save a pre-change snapshot of a file the agent is about to create/
+    edit/delete, so /undo can restore it. If the file doesn't exist yet
+    (a brand-new create_file), there's nothing to snapshot — undoing that
+    just means deleting the file, tracked via backup_file=None."""
+    full = os.path.expanduser(path)
+    entry = {"ts": time.time(), "path": full, "action": action, "backup_file": None}
+    if os.path.isfile(full):
+        try:
+            ts_tag = time.strftime("%Y%m%d_%H%M%S_%f")
+            backup_path = os.path.join(_agent_backup_dir(), f"{ts_tag}_{os.path.basename(full)}.bak")
+            shutil.copy2(full, backup_path)
+            entry["backup_file"] = backup_path
+        except Exception:
+            return  # never block the real operation over a failed backup
+    log = _agent_backup_log_load()
+    log.append(entry)
+    _agent_backup_log_save(log)
+
+def cmd_undo() -> None:
+    """Restore the most recent agent-driven file change (create/edit/delete)."""
+    log = _agent_backup_log_load()
+    if not log:
+        print(f"\n{NEON_Y}Nothing to undo — no tracked agent file changes yet.{R}\n")
+        return
+    entry = log.pop()
+    path, action, backup_file = entry["path"], entry["action"], entry.get("backup_file")
+    try:
+        if backup_file and os.path.isfile(backup_file):
+            shutil.copy2(backup_file, path)
+            print(f"\n{NEON_G}✓ Restored {path} to its state before the last {action}.{R}\n")
+        elif os.path.isfile(path):
+            os.remove(path)
+            print(f"\n{NEON_G}✓ Removed {path} (it didn't exist before that change).{R}\n")
+        else:
+            print(f"\n{NEON_Y}Nothing to restore — {path} is already gone.{R}\n")
+        _agent_backup_log_save(log)
+    except Exception as e:
+        print(f"\n{NEON_R}✗ Undo failed: {e}{R}\n")
+
+def _quick_syntax_check(path: str) -> str:
+    """Run a fast syntax-only check right after the agent writes a file, so
+    a broken edit surfaces immediately in the tool result instead of the
+    agent finding out several steps later. Currently covers Python and JSON;
+    silently no-ops for other file types."""
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if ext == ".py":
+            r = subprocess.run([sys.executable, "-m", "py_compile", path],
+                               capture_output=True, text=True, timeout=10)
+            if r.returncode != 0:
+                return f"\n⚠ SYNTAX ERROR:\n{r.stderr.strip()[-500:]}"
+        elif ext == ".json":
+            with open(path) as f:
+                json.load(f)
+    except subprocess.TimeoutExpired:
+        return ""
+    except json.JSONDecodeError as e:
+        return f"\n⚠ INVALID JSON: {e}"
+    except Exception:
+        return ""
+    return ""
 
 def execute_action(atype: str, parts: list, cfg: dict | None = None) -> str:
     try:
@@ -1659,30 +1918,40 @@ def execute_action(atype: str, parts: list, cfg: dict | None = None) -> str:
 
         elif atype == "run_command":
             r = subprocess.run(parts[0], shell=True, capture_output=True,
-                               text=True, timeout=30, cwd=os.path.expanduser("~"))
+                               text=True, timeout=60, cwd=os.getcwd())
             out = r.stdout.strip()
             if r.stderr.strip(): out += f"\n[stderr] {r.stderr.strip()}"
+            if r.returncode != 0: out += f"\n[exit code] {r.returncode}"
             return out or "(no output)"
 
         elif atype == "create_file":
             path = os.path.expanduser(parts[0])
             content = parts[1] if len(parts) > 1 else ""
+            _agent_snapshot(path, "create")
             os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
             with open(path,"w") as f: f.write(content)
-            return f"Created: {path}"
+            return f"Created: {path}" + _quick_syntax_check(path)
 
         elif atype == "edit_file":
             path = os.path.expanduser(parts[0])
             old  = parts[1] if len(parts) > 1 else ""
             new  = parts[2] if len(parts) > 2 else ""
             with open(path,"r") as f: c = f.read()
-            if old not in c: return f"⚠ Text not found in {path}"
+            count = c.count(old)
+            if count == 0:
+                return f"⚠ Text not found in {path} — read_file it first to get the exact text."
+            if count > 1:
+                return (f"⚠ That text appears {count} times in {path} — edit_file needs a unique "
+                        f"match. Include more surrounding context (a line above/below) and try again.")
+            _agent_snapshot(path, "edit")
             with open(path,"w") as f: f.write(c.replace(old,new,1))
-            return f"Edited: {path}"
+            return f"Edited: {path}" + _quick_syntax_check(path)
 
         elif atype == "delete_file":
-            os.remove(os.path.expanduser(parts[0]))
-            return f"Deleted: {parts[0]}"
+            path = os.path.expanduser(parts[0])
+            _agent_snapshot(path, "delete")
+            os.remove(path)
+            return f"Deleted: {parts[0]} (backup kept — /undo can restore it)"
 
         elif atype == "open_app":
             subprocess.Popen(parts[0], shell=True,
@@ -1692,6 +1961,15 @@ def execute_action(atype: str, parts: list, cfg: dict | None = None) -> str:
         elif atype == "search_files":
             found = glob.glob(os.path.expanduser(parts[0]), recursive=True)[:20]
             return "\n".join(found) if found else "No matches."
+
+        elif atype == "grep_files":
+            pattern = parts[0]
+            path    = parts[1] if len(parts) > 1 else "."
+            return _grep_files(pattern, path)
+
+        elif atype == "list_dir":
+            path = parts[0] if parts and parts[0] else "."
+            return _list_dir(path)
 
         elif atype == "read_file":
             with open(os.path.expanduser(parts[0]),"r",errors="replace") as f:
@@ -1716,7 +1994,11 @@ def process_actions(text: str, cfg: dict | None = None) -> str:
             print(f"  {NEON_G}✓{R}")
             for line in out.split("\n")[:10]:
                 print(f"    {DIM}{line}{R}")
-            results.append(f"[{a['type']}] {out[:150]}")
+            # feed back enough for the model to actually self-correct on errors —
+            # 150 chars used to cut error messages off mid-sentence, which made
+            # the agent guess instead of reading what actually went wrong
+            trimmed = out if len(out) <= 3000 else out[:3000] + "\n…[truncated, output was longer]"
+            results.append(f"[{a['type']}] {trimmed}")
         else:
             print(f"  {NEON_Y}⊘ Skipped{R}")
             results.append(f"[{a['type']}] skipped")
@@ -2149,6 +2431,7 @@ def _help_sections() -> list:
             ("/regen",   "Regenerate the last response"),
             ("/model",   "List or hot-swap the loaded model (no restart)"),
             ("/export [html]", "Export the conversation to a file"),
+            ("/undo",    "Restore the last agent-made file change"),
             ("/info",    "Show model info"),
             ("/save",    "Save config"),
             ("/exit",    "Exit"),
@@ -5103,7 +5386,7 @@ def ask(cfg: dict, messages: list, session_msgs: list,
     mc   = mode["color"]
     bw   = min(cols(), 62)
     is_agent_mode = cfg.get("mode") == "agent"
-    max_iters     = max(1, int(cfg.get("max_agent_iters", 6)))
+    max_iters     = max(1, int(cfg.get("max_agent_iters", 12)))
 
     print(f"\n{mc}{'▓'*bw}{R}")
     print(f"{mc}{BOLD}  {mode['icon']} {mode['label']}{R}")
@@ -5118,18 +5401,32 @@ def ask(cfg: dict, messages: list, session_msgs: list,
     session_msgs.append({"role":"assistant","content":response})
 
     # ── Real tool-calling loop ─────────────────────────────────
-    # Read-only tool results (search_files/read_file/web_search/rag_search)
-    # get fed straight back to the model automatically, up to max_iters times,
-    # so the agent can act on what it learned without the user repeating itself.
-    # Destructive actions still stop the loop to wait for explicit approval.
+    # Read-only tool results (search_files/grep_files/list_dir/read_file/
+    # web_search/rag_search) get fed straight back to the model automatically,
+    # up to max_iters times, so the agent can act on what it learned without
+    # the user repeating itself. Destructive actions still stop the loop to
+    # wait for explicit approval.
     iters = 0
     last_response = response
+    recent_actions: list = []  # signatures of recently-run actions — catches stuck loops
     while is_agent_mode and iters < max_iters:
         actions = parse_actions(last_response)
         if not actions:
             break
 
-        action_results = process_actions(last_response, cfg)
+        # loop detection: if the model issues the exact same action twice in a
+        # row, it's almost certainly stuck (e.g. re-running a command that
+        # already failed the same way) — nudge it to change approach instead
+        # of burning iterations repeating the same mistake.
+        sig = tuple((a["type"], tuple(a["parts"])) for a in actions)
+        if recent_actions and recent_actions[-1] == sig:
+            action_results = ("[SYSTEM] You just issued the exact same action(s) again. "
+                "That already ran and its result is above — repeating it won't change the "
+                "outcome. Read the previous result carefully and try a genuinely different "
+                "approach, or explain to the user what's blocking you.")
+        else:
+            action_results = process_actions(last_response, cfg)
+        recent_actions.append(sig)
         if not action_results:
             break
 
@@ -5946,6 +6243,8 @@ def repl(cfg: dict, one_shot: str | None = None) -> None:
             cmd_compact(cfg, messages)
         elif cmd == "/export":
             cmd_export(arg, session_msgs)
+        elif cmd == "/undo":
+            cmd_undo()
         elif cmd == "/info":
             mp = cfg.get("model_path","none")
             sz = f"{os.path.getsize(mp)/1e9:.1f} GB" if os.path.exists(mp) else "?"
