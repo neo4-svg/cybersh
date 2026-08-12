@@ -12,13 +12,74 @@
 **CYBER SH — Your Personal Offline AI Assistant**  
 Runs entirely on your own computer. No cloud. No subscriptions. No one watching.
 
-![Version](https://img.shields.io/badge/version-1.8-brightgreen)
+![Version](https://img.shields.io/badge/version-1.9-brightgreen)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-orange)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)
 ![Security](https://img.shields.io/badge/security-audited%20v1.4-blue)
 
 </div>
+
+---
+
+## 🆕 v1.9 — Smarter Agent, Fewer Errors
+
+v1.9 is focused on one thing: making `/agent` actually reliable in a real project instead of just capable in a demo. Several of these are fixes for real bugs, not just new features.
+
+### 🧠 The agent now knows its actual environment, not just its OS
+
+Before, the agent only knew which Linux distro it was on. That's not enough to avoid errors — the single most common avoidable mistake was assuming `python` exists when a system only has `python3`. The agent's environment context now includes the exact Python command to use, the real shell, the current working directory, and whether it's inside a git repo, and it's told to use those facts exactly instead of guessing.
+
+### 🔍 `grep_files` and `list_dir` — the agent can finally explore before it edits
+
+Two new read-only tools, no approval needed:
+```
+ACTION: grep_files | <regex> | <path>   → search file CONTENTS, not just names
+ACTION: list_dir | <path>               → directory tree, so it can orient itself
+```
+Previously the agent could only find files by name (`search_files`), never by what's actually inside them — so it was editing code somewhat blind. The agent system prompt now explicitly tells it to orient with these before touching anything, and to always `read_file` a section before `edit_file`-ing it.
+
+### 🛡️ `edit_file` now refuses ambiguous matches
+
+If the text you're asking it to replace appears more than once in a file, `edit_file` used to silently patch the *first* occurrence — possibly the wrong one. It now refuses and asks for more surrounding context, the same exact-match discipline Claude Code's own edit tool uses.
+
+### 👀 Real diff preview before you approve an edit
+
+Approving an `edit_file` action now shows an actual colorized unified diff (green additions, red removals) instead of just a filename. `create_file` shows the new content and warns if it's about to overwrite something that already exists.
+
+### 💾 Automatic backups + `/undo`
+
+Every `create_file`, `edit_file`, and `delete_file` the agent performs now snapshots the file first to `~/.cybersh_backups/`. If it gets something wrong, `/undo` restores the file to exactly how it was before that change — including bringing back a file the agent just deleted.
+
+### ✅ Instant syntax checking after every write
+
+Right after the agent writes a `.py` or `.json` file, it's automatically checked (`py_compile` / JSON parse) and any error is fed straight back into the same tool result — so a broken edit surfaces immediately instead of the agent finding out three steps later.
+
+### 🔁 Loop detection
+
+If the agent issues the exact same action twice in a row — a classic sign it's stuck re-running something that already failed the same way — it now gets an explicit nudge to stop repeating itself and actually read what went wrong, instead of quietly burning iterations.
+
+### 🐛 Fixed: tool results were being cut to 150 characters
+
+This was a real bug. Every tool result — command output, file contents, error messages — was being truncated to 150 characters before being fed back to the agent. Long error messages were getting cut off mid-sentence, so the agent was often working from incomplete information and making worse decisions as a result. The limit is now 3000 characters with a clear "truncated" marker if it's still not enough.
+
+### 📄 `CYBERSH.md` — project-specific context, automatically
+
+Drop a `CYBERSH.md` (or `.cybersh.md`) file in your project root and its contents get automatically injected into every mode's system prompt — the same idea as Claude Code's `CLAUDE.md`. Use it for build/test commands, coding conventions, or anything else the AI should always know about that specific project.
+
+```
+# CYBERSH.md
+This project uses pytest. Run `make test` before considering any change done.
+Follow the existing snake_case naming — don't introduce camelCase.
+```
+
+### 🎯 Do exactly what was asked
+
+The agent system prompt now explicitly instructs the model to do exactly what was requested — no unrequested extra features, files, or "improvements" — and to ask one short clarifying question if a request is genuinely ambiguous about *what* to build, rather than guessing and going off in the wrong direction.
+
+### ⏱️ More room to actually finish multi-step tasks
+
+`max_agent_iters` default raised from 6 to 12. Real coding tasks (explore → read → edit → test → fix → re-test) burn through iterations fast; 6 often wasn't enough to finish before the loop cut off.
 
 ---
 
@@ -220,7 +281,7 @@ A section of `session_save` used `chr(109)+chr(101)+...` to spell out dictionary
 **6. Downloaded model SHA-256 verification (Important)**  
 Models downloaded via `/models` or `--setup` are now verified against a SHA-256 checksum after download. A corrupted download or a tampered file will be detected and deleted automatically.
 
-> **How to get v1.4/v1.5:** Just run the tool — the auto-updater handles it. Or pull the repo manually: `git pull && python3 cybersh_direct.py`
+> **How to get the latest version:** Just run the tool — the auto-updater handles it. Or pull the repo manually: `git pull && python3 cybersh_direct.py`
 
 ---
 
@@ -233,7 +294,11 @@ Models downloaded via `/models` or `--setup` are now verified against a SHA-256 
 | AI chat, all modes | ❌ No |
 | Memory, personas, goals, sessions | ❌ No |
 | Code help, file analysis | ❌ No |
+| Agent mode — file/command actions | ❌ No |
 | `/image` — local image generation | ❌ No (after first model download) |
+| `/rag` — local retrieval | ❌ No |
+| `/see` — local vision | ❌ No |
+| `--gui` — browser-based GUI | ❌ No (runs on 127.0.0.1 only) |
 | `/fetch` — fetch & save a URL | ✅ Yes |
 | `/web` — web search | ✅ Yes |
 | `/weather` — weather | ✅ Yes |
@@ -257,7 +322,7 @@ CYBER SH **updates itself automatically every time you run it.**
 - If you are offline, it simply skips the check and continues normally
 - **You never need to run any update command manually — ever**
 
-> Your AI models, chat memory, saved sessions, notes, goals, config, and `cybersh_webagent.json` are **never touched by updates.** Only the script file itself gets replaced.
+> Your AI models, chat memory, saved sessions, notes, goals, config, RAG index, plugins, agent backups, and `cybersh_webagent.json` are **never touched by updates.** Only the script file itself gets replaced.
 
 ---
 
@@ -332,7 +397,13 @@ python3 cybersh_direct.py --setup
 python3 cybersh_direct.py
 ```
 
-**That is it.** Every time you want to use CYBER SH, just run this one command from the `cybersh` folder.
+Or launch the browser GUI instead of the terminal:
+
+```bash
+python3 cybersh_direct.py --gui
+```
+
+**That is it.** Every time you want to use CYBER SH, just run one of these commands from the `cybersh` folder.
 
 ---
 
@@ -352,7 +423,7 @@ During setup, pick the model that fits your machine:
 
 **Not sure which to pick?** Choose **[5] Llama 3.2 3B** — works great on most laptops.
 
-You can download and switch models anytime inside the app with `/models`.
+You can download and switch models anytime inside the app with `/models` (download new) or `/model` (hot-swap one already downloaded, no restart needed).
 
 ---
 
@@ -384,14 +455,14 @@ wsl --install
 ### Choose a mode when you start
 
 ```
-[1] 🤖 Agent  — AI controls your computer (runs commands, creates files, opens apps)
+[1] 🤖 Agent  — AI controls your computer (runs commands, creates/edits files, explores your codebase)
 [2] 🔐 Sec    — Security expert for bug bounty, pentesting, CVE analysis
 [3] 🎨 Vibe   — Creative coding, beautiful UI, design ideas
 [4] ⚡ Code   — Clean production code with error handling and comments
 [5] 💬 Chat   — General assistant, ask it anything
 ```
 
-Switch modes any time by typing `/agent`, `/sec`, `/vibe`, `/code`, or `/chat`.
+Switch modes any time by typing `/agent`, `/sec`, `/vibe`, `/code`, or `/chat`. Or skip the terminal entirely with `python cybersh_direct.py --gui` for a browser-based version of Chat/Sec/Code/Vibe.
 
 ---
 
@@ -418,6 +489,15 @@ Switch modes any time by typing `/agent`, `/sec`, `/vibe`, `/code`, or `/chat`.
 /session load 1                     → load and merge an old chat into current one
 /session search XSS                 → search across all saved chats for a keyword
 /session delete 2                   → delete a saved session
+```
+
+**Managing the live conversation:**
+
+```
+/context           → see how much of the context window is in use
+/compact            → AI-summarizes older history to free up context, keeps the thread
+/regen              → redo the last response
+/export [html]      → save the conversation to a Markdown or HTML file
 ```
 
 ---
@@ -453,7 +533,7 @@ Switch modes any time by typing `/agent`, `/sec`, `/vibe`, `/code`, or `/chat`.
 
 ---
 
-### 🖼️ Image Generation (new in v1.5)
+### 🖼️ Image Generation
 
 ```
 /image a neon cyberpunk city at night
@@ -464,7 +544,7 @@ Switch modes any time by typing `/agent`, `/sec`, `/vibe`, `/code`, or `/chat`.
 
 ---
 
-### 🌐 Web Agent — persistent site memory (new in v1.5)
+### 🌐 Web Agent — persistent site memory
 
 ```
 /fetch https://railway.com                         → fetch and save the site
@@ -530,10 +610,36 @@ Once a site is saved, just mention it naturally — cybersh auto-fetches and inj
 
 ```
 /agent
-> create a Flask app with a health check endpoint
+> add input validation to the signup endpoint and write a test for it
 ```
 
-The AI plans, then issues `ACTION:` blocks to run commands, create/edit/delete files, open apps, search and read files, search the web, or query your RAG index. Destructive actions always wait for your approval; read-only results are fed back automatically so it can chain multiple steps in one request.
+**How it actually works (v1.9):** the agent orients itself first — `list_dir` and `grep_files` to understand your project — then `read_file`s the exact section it's about to touch, makes a targeted `edit_file` change (rejected automatically if the match isn't unique), and verifies its own work by running your tests or a quick syntax check via `run_command`. It works through the whole task across multiple steps on its own instead of stopping to ask permission at every turn, up to `max_agent_iters` (default 12) tool round-trips per request.
+
+**Tools it can use:**
+```
+ACTION: run_command | <bash command>              (needs your approval)
+ACTION: create_file | <path> | <content>           (needs your approval)
+ACTION: edit_file | <path> | <old text> | <new text>  (needs your approval, unique match required)
+ACTION: delete_file | <path>                        (needs your approval)
+ACTION: open_app | <app>                            (needs your approval)
+ACTION: make_dir | <path>                           (needs your approval)
+ACTION: search_files | <glob pattern>               (read-only, runs immediately)
+ACTION: grep_files | <regex> | <path>                (read-only, runs immediately)
+ACTION: list_dir | <path>                            (read-only, runs immediately)
+ACTION: read_file | <path>                           (read-only, runs immediately)
+ACTION: web_search | <query>                         (read-only, runs immediately)
+ACTION: rag_search | <query>                         (read-only, runs immediately)
+```
+
+Every approval prompt for `edit_file` shows you a real colorized diff first. Every `create_file`/`edit_file`/`delete_file` is backed up automatically — if the agent gets something wrong, `/undo` restores the file to how it was.
+
+**Project-specific context — like Claude Code's `CLAUDE.md`:** drop a `CYBERSH.md` (or `.cybersh.md`) file in your project root and its contents are automatically read into every mode's system prompt.
+
+```md
+# CYBERSH.md
+This project uses pytest. Run `make test` before considering any change done.
+Follow the existing snake_case naming.
+```
 
 ---
 
@@ -548,6 +654,17 @@ The AI plans, then issues `ACTION:` blocks to run commands, create/edit/delete f
 /rag list                                → see what's indexed
 /rag clear                               → wipe the index
 ```
+
+---
+
+### 🖥️ Browser-based GUI
+
+```
+python cybersh_direct.py --gui
+python cybersh_direct.py --gui --port 8421   # if 8420 is taken
+```
+
+Runs entirely on `127.0.0.1` with zero extra dependencies (stdlib `http.server` only). Mode switcher, model dropdown, streaming responses, a context-usage bar, and one-click Regen/Compact/Export/Clear. Agent mode's tool execution with approval prompts is intentionally terminal-only — a real confirm dialog matters more than convenience for anything that touches your filesystem.
 
 ---
 
@@ -606,6 +723,7 @@ Plugins are plain `.py` files in `~/.cybersh_plugins/` (or `./cybersh_plugins/`)
 /o ~/output/result.py   → save last AI response to a file
 /run                    → run the last code block (asks confirmation first)
 /copy                   → copy last response to clipboard
+/undo                   → restore the last agent-made file change (create/edit/delete)
 ```
 
 ---
@@ -614,6 +732,7 @@ Plugins are plain `.py` files in `~/.cybersh_plugins/` (or `./cybersh_plugins/`)
 
 | Version | What was added |
 |---------|---------------|
+| **v1.9** | **Smarter, more reliable `/agent`** — environment context now includes the exact python binary, shell, cwd, and git status instead of just the OS · **`grep_files`** (content search) and **`list_dir`** (directory tree) so the agent can orient itself before editing · `edit_file` now refuses ambiguous (non-unique) matches · real colorized diff preview before approving an edit · **automatic backups + `/undo`** for every agent file change · instant `py_compile`/JSON syntax check right after a write · loop detection for repeated failing actions · **fixed a real bug** where tool results were truncated to 150 characters, starving the agent of the error detail it needed to self-correct (now 3000) · **`CYBERSH.md`** project-context file, auto-injected into every mode (like Claude Code's `CLAUDE.md`) · explicit "do exactly what was asked, nothing extra" instruction · `max_agent_iters` default raised 6 → 12 |
 | **v1.8** | **Automatic context management** — auto-trims oldest turns once the conversation nears the model's context budget instead of crashing with a hard overflow error, in both chat and the agent loop · **`/model`** — list and hot-swap the loaded `.gguf` model without restarting · **`/regen`** — redo the last response · **`/context`** — see current context-window usage · **`/compact`** — AI-summarizes older history instead of just dropping it · **`/export [html]`** — save the conversation to a Markdown or HTML file · **`--gui`** — browser-based GUI (stdlib only, no extra deps) with mode switching, model dropdown, streaming, and one-click Regen/Compact/Export/Clear · `/models` now loads a freshly downloaded model immediately instead of requiring a restart |
 | **v1.7** | **Direct-to-gguf prompt caching** — in-RAM `LlamaCache` attached straight to the loaded chat/embedder/vision models, so repeated or shared-prefix prompts skip re-evaluation · RAG index now cached in RAM instead of re-read from disk every call · rewritten `/code` system prompt (full files, edge cases, security/perf called out unprompted) · `/review` `/debug` `/testgen` `/docstring` `/complexity` now accept a file path directly · **native Windows fixes** — pure-Python downloader replaces the `wget` dependency, SHA-256 model verification actually wired in, ANSI colors enabled on `cmd.exe` |
 | **v1.6** | **Agent tool-calling loop** — real `ACTION:` execution with approval gating for destructive steps · **`/see`** local vision (LLaVA/Phi-3 multimodal) · **`/rag`** local offline retrieval over your own files · plugin system with hot-reload (`/plugins`) · rebuilt searchable `/help` · `/testgen` `/docstring` `/complexity` `/gitdiff` `/commitmsg` `/todo` `/gitignore` `/license` `/lint` `/profile` |
@@ -674,6 +793,9 @@ The tool auto-detects your display server and prints the exact install command f
 CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --force-reinstall --break-system-packages
 ```
 
+**Agent keeps repeating the same failed command:**  
+This should now self-correct (v1.9 loop detection) — if it still gets stuck, `/undo` any partial file changes and try rephrasing the task more specifically.
+
 ---
 
 ## 📁 What Updates Touch — What They Don't
@@ -690,6 +812,7 @@ CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --force-reinstall --bre
 | Your goals | `~/.cybersh_goals.json` | ✅ Never touched |
 | Your RAG index | `~/.cybersh_rag/` | ✅ Never touched |
 | Your plugins | `~/.cybersh_plugins/` | ✅ Never touched |
+| Your agent file backups | `~/.cybersh_backups/` | ✅ Never touched |
 
 ---
 
